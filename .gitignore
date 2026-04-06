@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+.pnp.*
+.yarn/
+
+# Build output
+dist/
+/build/
+.next/
+.nuxt/
+.output/
+.svelte-kit/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# IDE & OS
+.DS_Store
+Thumbs.db
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+
+# Testing
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Claude Code local settings (user-specific, not shared)
+.claude/settings.local.json
+
+# Temporary files
+*.tmp
+*.swp
