@@ -17,31 +17,31 @@ default:
 
 # Install project dependencies
 install:
-    npm install
+    bun install
 
 # ── Development ───────────────────────────────────
 
 # Start development server
 dev:
-    npm run dev
+    bun run src/index.ts
 
 # Build for production
 build:
-    npm run build
+    bun build src/index.ts --outdir dist --target bun
 
 # ── Quality gate ──────────────────────────────────
 
-# Run linter (used by `just check`)
+# Run linter / type checker
 lint:
-    npm run lint
+    bun run lint
 
-# Run type checker (used by `just check`)
+# Run type checker
 typecheck:
-    npm run typecheck
+    bun run typecheck
 
-# Run tests (used by `just check`)
+# Run tests
 test:
-    npm run test
+    bun run test
 
 # Quality gate: lint + typecheck + test  ← used by /check skill
 check: lint typecheck test
@@ -55,4 +55,4 @@ ci: install check build
 
 # Remove build artifacts
 clean:
-    rm -rf dist .next .turbo
+    rm -rf dist

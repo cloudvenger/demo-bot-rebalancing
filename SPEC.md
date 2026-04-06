@@ -159,7 +159,7 @@ Acceptance criteria:
 As a vault operator, I want a step-by-step guide to create a Morpho Vault V2 for USDC with 2-3 Morpho Blue markets so that I can set up the vault my bot will manage.
 
 Acceptance criteria:
-- [ ] Guide is a markdown file at `docs/vault-setup-guide.md`
+- [ ] Guide is a markdown file at `docs/rebalancing/vault-setup-guide.md`
 - [ ] Covers: prerequisites (ETH for gas, USDC, Foundry installed)
 - [ ] Covers: deploying a Vault V2 via VaultV2Factory with USDC as asset
 - [ ] Covers: deploying 2-3 MorphoMarketV1AdapterV2 adapters for specific USDC markets: USDC/WETH (high liquidity), USDC/wstETH (LST demand), USDC/WBTC (BTC collateral)
@@ -235,7 +235,7 @@ Acceptance criteria:
 
 ## Technical Patterns
 
-> Full architecture elaboration with diagrams: [docs/architecture.md](docs/architecture.md)
+> Full architecture elaboration with diagrams: [docs/rebalancing/architecture.md](docs/rebalancing/architecture.md)
 
 Summary:
 - **Service-oriented**: `RebalanceService` orchestrates the flow, `ChainReader` reads on-chain state, `Strategy` computes allocations (pure), `Executor` submits transactions, `Notifier` sends Telegram alerts

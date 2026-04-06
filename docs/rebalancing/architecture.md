@@ -1,6 +1,6 @@
 # Architecture — Morpho V2 Rebalancing Bot
 
-> Referenced from [SPEC.md](../SPEC.md) — Technical Patterns section.
+> Referenced from [SPEC.md](../../SPEC.md) — Technical Patterns section.
 
 ---
 

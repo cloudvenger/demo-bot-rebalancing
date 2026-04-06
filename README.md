@@ -1,0 +1,142 @@
+# Morpho V2 Rebalancing Bot
+
+Automated allocation rebalancing for [Morpho Vault V2](https://docs.morpho.org/learn/concepts/vault-v2/) on Ethereum mainnet. The bot reads on-chain state, computes optimal allocations across Morpho Blue markets using projected post-rebalance APY, and executes `allocate` / `deallocate` transactions — all within configurable cap and gas constraints.
+
+## How it works
+
+```
+Every N minutes (cron):
+
+  1. READ    — vault adapters, market rates, IRM params, caps
+  2. COMPUTE — score markets by projected APY, liquidity, concentration
+  3. EXECUTE — deallocate overweight, allocate underweight
+  4. NOTIFY  — Telegram alert with tx hashes and new allocations
+```
+
+The strategy uses a **hybrid IRM** approach: read Interest Rate Model parameters on-chain once per cycle, then simulate post-rebalance rates off-chain in TypeScript. This avoids chasing displayed APY — the bot predicts what it will *actually* earn after moving capital.
+
+## Stack
+
+| Layer | Tool |
+|---|---|
+| Runtime | [Bun](https://bun.sh) |
+| Framework | [Fastify](https://fastify.dev) |
+| Chain interaction | [viem](https://viem.sh) + [@morpho-org/blue-sdk](https://github.com/morpho-org/morpho-blue-sdk) |
+| Scheduler | [croner](https://github.com/hexagon/croner) |
+| Testing | [Vitest](https://vitest.dev) + [Anvil](https://book.getfoundry.sh/reference/anvil/) |
+| Config validation | [zod](https://zod.dev) |
+| Alerts | Telegram Bot API |
+
+## Quick start
+
+```bash
+# Install dependencies
+bun install
+
+# Copy env template and fill in your values
+cp .env.example .env
+
+# Start in dry-run mode (no transactions submitted)
+DRY_RUN=true bun run dev
+
+# Run tests
+bun run test
+```
+
+See [walkthrough.md](walkthrough.md) for the full setup guide.
+
+## Configuration
+
+All settings are in `.env`, validated with zod at startup. The bot refuses to start with invalid config.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `RPC_URL` | Yes | — | Ethereum mainnet RPC endpoint |
+| `PRIVATE_KEY` | Yes | — | Wallet with Allocator role on the vault |
+| `VAULT_ADDRESS` | Yes | — | Morpho Vault V2 contract address |
+| `TELEGRAM_BOT_TOKEN` | Yes | — | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | Yes | — | Telegram chat ID for alerts |
+| `CRON_SCHEDULE` | No | `*/5 * * * *` | Rebalance check frequency |
+| `DRIFT_THRESHOLD_BPS` | No | `500` (5%) | Min drift to trigger rebalance |
+| `GAS_CEILING_GWEI` | No | `50` | Skip execution if gas exceeds this |
+| `DRY_RUN` | No | `false` | Log actions without submitting txs |
+| `MAX_MARKET_CONCENTRATION_PCT` | No | `10` | Max % of a market's supply to allocate |
+| `MIN_LIQUIDITY_MULTIPLIER` | No | `2` | Reject markets with low exit liquidity |
+
+## API endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Health check (200 ok / 503 degraded) |
+| `GET` | `/api/v1/status` | Current vault allocations and bot state |
+| `POST` | `/api/v1/rebalance` | Manually trigger a rebalance cycle |
+
+## Project structure
+
+```
+src/
+  index.ts                        # Fastify entry point
+  config/
+    env.ts                        # Zod-validated environment config
+    constants.ts                  # Contract addresses, ABIs, chain config
+  core/
+    rebalancer/
+      types.ts                    # Domain types
+      irm.ts                     # Pure IRM simulation
+      strategy.ts                # Scoring, delta computation, cap enforcement
+      engine.ts                  # Strategy orchestrator
+    chain/
+      client.ts                  # viem client factory
+      vault.ts                   # Vault V2 on-chain reads
+      morpho.ts                  # Morpho Blue market reads
+      executor.ts                # Transaction builder + submitter
+  plugins/
+    scheduler.ts                 # Cron trigger
+    health.ts                    # GET /health
+    api.ts                       # Status + manual rebalance endpoints
+  services/
+    rebalance.service.ts         # Read -> compute -> execute -> notify
+    notifier.ts                  # Telegram alerts
+test/
+  unit/                          # Pure logic tests (no network)
+  integration/                   # Mocked chain + API tests
+script/
+  DeployVault.s.sol              # Foundry vault deployment script
+docs/
+  project/
+    architecture.md              # Service architecture and patterns
+    vault-setup-guide.md         # Step-by-step vault creation tutorial
+```
+
+## Architecture
+
+The bot follows a **service-oriented** pattern with strict separation of concerns. The strategy module is **pure** (no async, no RPC) — all chain interaction is isolated in the `chain/` layer. Each error boundary is independent: a Telegram outage never blocks rebalancing, a failed transaction never crashes the bot.
+
+Full architecture with diagrams: [docs/rebalancing/architecture.md](docs/rebalancing/architecture.md)
+
+## Vault setup
+
+If you don't have a Morpho Vault V2 yet:
+- [Vault setup guide](docs/rebalancing/vault-setup-guide.md) — step-by-step with `cast` commands
+- [Foundry deployment script](script/README.md) — automated deployment on a forked mainnet
+
+## Development
+
+```bash
+just dev        # Start the bot
+just test       # Run tests
+just check      # Lint + typecheck + tests
+```
+
+## v2 roadmap
+
+- Multi-chain support (Base, Arbitrum)
+- Event-driven triggers (hybrid cron + WebSocket)
+- MEV protection (Flashbots Protect)
+- AWS KMS key management
+- Historical analytics database
+- Multi-vault fleet management
+
+## License
+
+MIT

@@ -1,0 +1,6 @@
+[profile.default]
+src = "script"
+out = "script/out"
+libs = ["lib"]
+evm_version = "paris"
+solc = "0.8.24"
