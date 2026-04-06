@@ -1,5 +1,11 @@
 # Morpho V2 Rebalancing Bot
 
+[![CI](https://github.com/cloudvenger/demo-bot-rebalancing/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudvenger/demo-bot-rebalancing/actions/workflows/ci.yml)
+![Coverage](https://img.shields.io/badge/coverage-93.4%25-brightgreen)
+![TypeScript](https://img.shields.io/badge/typescript-strict-blue)
+![Runtime](https://img.shields.io/badge/runtime-bun-f9f1e1)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 Automated allocation rebalancing for [Morpho Vault V2](https://docs.morpho.org/learn/concepts/vault-v2/) on Ethereum mainnet. The bot reads on-chain state, computes optimal allocations across Morpho Blue markets using projected post-rebalance APY, and executes `allocate` / `deallocate` transactions — all within configurable cap and gas constraints.
 
 ## How it works
@@ -123,10 +129,22 @@ If you don't have a Morpho Vault V2 yet:
 ## Development
 
 ```bash
-just dev        # Start the bot
-just test       # Run tests
-just check      # Lint + typecheck + tests
+just dev              # Start the bot
+just test             # Run tests
+bun run test:coverage # Run tests with coverage report
+just check            # Lint + typecheck + tests
 ```
+
+### Test coverage
+
+| Module | Stmts | Branch | Funcs |
+|---|---|---|---|
+| config/ | 100% | 100% | 100% |
+| core/rebalancer/ | 97.4% | 89.4% | 100% |
+| core/chain/ | 95.2% | 98.0% | 96.4% |
+| services/ | 97.5% | 76.9% | 100% |
+| plugins/ | 76.4% | 95.2% | 87.5% |
+| **Overall** | **93.4%** | **91.4%** | **97.0%** |
 
 ## v2 roadmap
 

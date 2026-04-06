@@ -6,5 +6,11 @@ export default defineConfig({
     testTimeout: 30000,
     globals: false,
     environment: "node",
+    coverage: {
+      provider: "v8",
+      include: ["src/**/*.ts"],
+      exclude: ["src/index.ts"],
+      reporter: ["text", "text-summary", "json-summary"],
+    },
   },
 });
