@@ -13,7 +13,7 @@ Full workflow reference: [docs/workflow.md](docs/workflow.md)
 | `SPEC.md` | Product spec — source of truth for requirements |
 | `PLAN.md` | Technical architecture and task breakdown |
 | `task.md` | Granular task checklist, updated as work progresses |
-| `docs/architecture.md` | Service architecture diagrams and patterns |
+| `docs/rebalancing/architecture.md` | Service architecture diagrams and patterns |
 
 ---
 
@@ -33,7 +33,7 @@ Full workflow reference: [docs/workflow.md](docs/workflow.md)
 
 ## Architecture Pattern
 
-- **Pattern**: Service-oriented — per [docs/architecture.md](docs/architecture.md)
+- **Pattern**: Service-oriented — per [docs/rebalancing/architecture.md](docs/rebalancing/architecture.md)
 - **Layer responsibilities**:
   - **Plugins** (`src/plugins/`): HTTP routes and cron registration — no business logic here
   - **Services** (`src/services/`): orchestration (read → compute → execute → notify) — owns the rebalance flow
