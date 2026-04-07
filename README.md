@@ -118,6 +118,8 @@ docs/
 
 The bot follows a **service-oriented** pattern with strict separation of concerns. The strategy module is **pure** (no async, no RPC) — all chain interaction is isolated in the `chain/` layer. Each error boundary is independent: a Telegram outage never blocks rebalancing, a failed transaction never crashes the bot.
 
+Guided walkthrough of the design and implementation: [docs/rebalancing/presentation.md](docs/rebalancing/presentation.md)
+
 Full architecture with diagrams: [docs/rebalancing/architecture.md](docs/rebalancing/architecture.md)
 
 ## Vault setup
