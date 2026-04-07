@@ -1,4 +1,4 @@
-# Interview Walkthrough — Morpho V2 Rebalancing Bot
+# Walkthrough — Morpho V2 Rebalancing Bot
 
 > A backend-only bot that automates allocation rebalancing for a **Morpho Vault V2**, optimising yield across Morpho Blue markets on Ethereum mainnet.
 >
@@ -165,7 +165,7 @@ A single cycle is the heart of the bot. It runs every `CRON_SCHEDULE` tick (defa
 
 ## 5. Strategy: How the Rebalance Decision is Made
 
-> This is the part the interviewer will probe hardest. It lives in the **pure** strategy layer — no chain calls, no async, fully unit-testable.
+> This is the most critical part of the system. It lives in the **pure** strategy layer — no chain calls, no async, fully unit-testable.
 
 The strategy answers two questions, in order:
 
