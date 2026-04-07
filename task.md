@@ -78,6 +78,11 @@
 > - Demo curator role: deployer = owner = curator
 > - Curator timelocks: leave at 0 at fresh deploy so the script can `multicall(submit + execute)` everything in one tx
 > - Market discovery: configured at startup via `MANAGED_MARKETS_PATH` JSON
+>
+> **Verified ABI facts** (locked down by reading actual `morpho-org/vault-v2` source 2026-04-07 — see PLAN.md § Verified cap-id preimages and § Cap units):
+> - The 3 cap ids per market come from exact `abi.encode(...)` preimages — any deviation = revert
+> - `relativeCap` is in WAD (`1e18` = 100%), NOT basis points
+> - `relativeCap == WAD` is the "no cap" sentinel; `relativeCap == 0` forbids the market
 
 ### 8.1 — Config + types (sequential, first)
 
@@ -90,6 +95,7 @@
   - Update `VaultState` to carry `adapterAddress` + `marketStates: MarketAllocationState[]` (paired with `marketData`)
   - Update `RebalanceAction` to add `marketLabel` and document that `data` is always ABI-encoded `MarketParams` and `adapter` is always the configured single adapter
   - Update `RebalanceResult.newAllocations` to be keyed by `marketLabel`, not `adapter`
+  - **Cap units**: store `absoluteCap` and `relativeCap` as `bigint` (uint256). `relativeCap` is in **WAD** (`1e18` = 100%), not basis points. Document the `relativeCap == WAD` "no cap" sentinel and the `relativeCap == 0` "forbid" trap. (See PLAN.md § Cap units.)
 - [ ] [qa] Update tests for env.ts to cover the new required fields
 - [ ] [qa] Add tests for `managed-markets.ts` — valid JSON, missing fields, invalid `MarketParams` shape
 
@@ -101,7 +107,8 @@
   - Constructor takes `(publicClient, vaultAddress, adapterAddress, managedMarkets)`
   - At startup: assert the configured adapter is enabled (enumerate `adaptersAt` over `adaptersLength`), assert `adapter.parentVault() == vaultAddress`, assert `vault.isAllocator(botWallet) == true`
   - Per cycle: multicall reads `vault.totalAssets()`, then for each managed market: `vault.allocation(marketSpecificId)` and `vault.absoluteCap(id) + vault.relativeCap(id)` for **all 3 ids** returned by `adapter.ids(marketParams)`
-  - Compute `marketSpecificId` off-chain in TypeScript (`keccak256(abi.encode("this/marketParams", adapter, marketParams))`) using viem `encodeAbiParameters` + `keccak256`, and assert it matches the third entry in `adapter.ids(marketParams)` at startup
+  - **Read both caps as `bigint` (uint256). Do not cast `relativeCap` to `Number` — it is a WAD value and would lose precision.**
+  - Compute all 3 ids off-chain in TypeScript using viem `encodeAbiParameters` + `keccak256`, with the verified preimages from PLAN.md § Verified cap-id preimages. At startup, assert that the locally computed ids match `adapter.ids(marketParams)` exactly — if any mismatch, abort.
   - Drop `resolveAdapterType` — there is only one adapter type to support in v1
   - Return `VaultState` with the new shape (per PLAN.md)
 - [ ] [qa] Update `test/integration/chain-reader.test.ts` against an Anvil fork with a fresh-deployed vault + adapter + managed markets — verify allocation reads, cap reads, startup assertions
@@ -111,6 +118,7 @@
 - [ ] [backend] Update [src/core/rebalancer/strategy.ts](src/core/rebalancer/strategy.ts):
   - Iterate `state.marketStates` instead of `state.adapters`
   - Cap enforcement now clamps against the **most restrictive** of the 3 ids per market (not a single `absoluteCap` field)
+  - **Fix the relativeCap math**: use `WAD = 10n ** 18n` as the divisor, not `BPS_DENOMINATOR`. Compute `relativeCapAmount = (totalAssets * relativeCap) / WAD`. Treat `relativeCap == WAD` as "no relative cap" (skip the clamp). Treat `relativeCap == 0n` as "market forbidden" — clamp the target to 0 and emit a deallocate-only action if currently allocated.
   - Emit `RebalanceAction` with `data = encodeMarketParams(marketParams)` and `marketLabel = market.label`
   - Math (`computeScore`, `projectSupplyAPY`, `isWithinDriftThreshold`) is unchanged
 - [ ] [backend] Fix [src/core/chain/executor.ts](src/core/chain/executor.ts):
@@ -130,7 +138,9 @@
   - `createVaultV2(owner, USDC, salt)` — owner, asset, salt order; no name/symbol
   - `createMorphoMarketV1AdapterV2(vault)` — single adapter, no MarketParams
   - `vault.setCurator(curator)` (owner-only, not timelocked)
-  - One `vault.multicall([...])` from the curator that wraps: `submit(addAdapter)` + `addAdapter`; for each managed market, for each id in `adapter.ids(marketParams)`: `submit(increaseAbsoluteCap)` + `increaseAbsoluteCap(idData, cap)` + same for relative cap; `submit(setIsAllocator)` + `setIsAllocator(botWallet, true)`
+  - One `vault.multicall([...])` from the curator that wraps: `submit(addAdapter)` + `addAdapter`; for each managed market, for **each of the 3 ids** in `adapter.ids(marketParams)`: `submit(increaseAbsoluteCap)` + `increaseAbsoluteCap(idData, cap)` + same for relative cap; `submit(setIsAllocator)` + `setIsAllocator(botWallet, true)`
+  - **Build `idData` using the verified preimages from PLAN.md § Verified cap-id preimages.** In Solidity: `abi.encode("this", adapter)`, `abi.encode("collateralToken", marketParams.collateralToken)`, `abi.encode("this/marketParams", adapter, marketParams)`. Off-by-one in the preimage = wasted gas + reverting allocate at runtime.
+  - **Pass `relativeCap` in WAD**, not basis points. Use `WAD = 1e18` for "no cap" or `5e17` for 50%. Never pass 0 unless you intend to forbid the market.
   - Read managed markets from a JSON file via `vm.readFile` + `vm.parseJsonAddress` etc., or from env vars
   - Log the deployed `vault`, `adapter`, and the resulting `managed-markets.json` content the operator should copy into the bot config
 - [ ] [docs] Rewrite [script/README.md](script/README.md) — explain the curator role, the timelock=0 default, the multicall flow, and the env vars (`OWNER`, `BOT_WALLET`, `MANAGED_MARKETS_JSON`, etc.)

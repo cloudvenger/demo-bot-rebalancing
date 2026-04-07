@@ -88,7 +88,7 @@ Per-market on-chain snapshot read each cycle.
 | `market` | `ManagedMarket` | From config |
 | `allocation` | `bigint` | `vault.allocation(marketSpecificId)` where `marketSpecificId = keccak256(abi.encode("this/marketParams", adapter, marketParams))` |
 | `allocationPercentage` | `number` | Computed: `allocation / totalAssets` |
-| `caps` | `Array<{ id, absoluteCap, relativeCap }>` | One entry per id in `market.capIds`, populated via `vault.absoluteCap(id)` + `vault.relativeCap(id)` |
+| `caps` | `Array<{ id: Hash, absoluteCap: bigint, relativeCap: bigint }>` | One entry per id in `market.capIds`, populated via `vault.absoluteCap(id)` + `vault.relativeCap(id)`. **`relativeCap` is a uint256 in WAD (1e18 = 100%), not basis points** — see § Verified cap-id preimages. |
 
 ### VaultState
 Aggregate snapshot captured by ChainReader at the start of each cycle.
@@ -182,10 +182,14 @@ A single `vault.allocate` or `vault.deallocate` call. The `adapter` field is con
         "allocationFormatted": "400,000 USDC",
         "percentage": 40.0,
         "caps": [
-          { "id": "0x...", "absoluteCap": "500000000000", "relativeCap": 5000 },
-          { "id": "0x...", "absoluteCap": "800000000000", "relativeCap": 8000 },
-          { "id": "0x...", "absoluteCap": "500000000000", "relativeCap": 5000 }
-        ]
+          { "id": "0x...", "absoluteCap": "500000000000", "relativeCap": "500000000000000000" },
+          { "id": "0x...", "absoluteCap": "800000000000", "relativeCap": "800000000000000000" },
+          { "id": "0x...", "absoluteCap": "500000000000", "relativeCap": "500000000000000000" }
+        ],
+        "capsHumanReadable": {
+          "absoluteCap": "500,000 USDC",
+          "relativeCapPct": "50%"
+        }
       }
     ],
     "lastRebalance": {
@@ -250,9 +254,41 @@ All are timelocked, but at fresh deploy the timelocks default to 0 so they can b
 ### MorphoMarketV1AdapterV2 (single adapter per vault)
 | Call | Type | Purpose |
 |---|---|---|
-| `ids(MarketParams calldata) returns (bytes32[3])` | read | Returns the 3 cap ids the vault checks during `allocate` for this market: an adapter-wide id, a collateral-token id, and the market-specific id `keccak256(abi.encode("this/marketParams", adapter, marketParams))` |
+| `ids(MarketParams calldata) returns (bytes32[])` | read | Returns the 3 cap ids the vault checks during `allocate` for this market |
 | `allocation(MarketParams calldata) returns (uint256)` | read | Convenience view forwarding to `vault.allocation(marketSpecificId)` |
 | `parentVault() returns (address)` | read | Used to verify the adapter belongs to the configured vault |
+| `adapterId() returns (bytes32)` | read | The adapter-wide id, set in the constructor as `keccak256(abi.encode("this", address(this)))` |
+
+### Verified cap-id preimages
+
+Source: [`src/adapters/MorphoMarketV1AdapterV2.sol:78,267-273`](https://github.com/morpho-org/vault-v2/blob/main/src/adapters/MorphoMarketV1AdapterV2.sol#L267) and [`src/VaultV2.sol:526-528`](https://github.com/morpho-org/vault-v2/blob/main/src/VaultV2.sol#L526) (verified 2026-04-07).
+
+The vault stores `caps[id]` keyed by `id = keccak256(idData)`. The curator must therefore pass the **exact preimage bytes** to `increaseAbsoluteCap(bytes idData, uint256)` so that the resulting hash matches one of the ids the adapter returns from `ids(marketParams)`. If the preimage is wrong, the cap exists for an unrelated hash and `vault.allocate(...)` reverts with `ZeroAbsoluteCap`.
+
+| # | Cap id semantics | `idData` preimage (bytes the curator passes) | TypeScript construction |
+|---|---|---|---|
+| 0 | Adapter-wide — applies to every market the adapter routes to | `abi.encode("this", address(adapter))` | `encodeAbiParameters([{type:'string'},{type:'address'}], ["this", adapter])` |
+| 1 | Collateral-token — applies to every market sharing the same collateral token | `abi.encode("collateralToken", marketParams.collateralToken)` | `encodeAbiParameters([{type:'string'},{type:'address'}], ["collateralToken", collateralToken])` |
+| 2 | Market-specific — applies to exactly one Morpho Blue market | `abi.encode("this/marketParams", address(adapter), marketParams)` | `encodeAbiParameters([{type:'string'},{type:'address'},{type:'tuple', components: marketParamsComponents}], ["this/marketParams", adapter, marketParams])` |
+
+The bot computes the market-specific id #2 itself in TypeScript and asserts at startup that it matches `adapter.ids(marketParams)[2]`. If the assertion fails, abi encoding is wrong and the bot must abort.
+
+### Cap units — `absoluteCap` and `relativeCap`
+
+Verified at [`src/VaultV2.sol:592-595`](https://github.com/morpho-org/vault-v2/blob/main/src/VaultV2.sol#L592):
+```solidity
+require(_caps.absoluteCap > 0, ErrorsLib.ZeroAbsoluteCap());
+require(_caps.allocation <= _caps.absoluteCap, ErrorsLib.AbsoluteCapExceeded());
+require(
+    _caps.relativeCap == WAD || _caps.allocation <= firstTotalAssets.mulDivDown(_caps.relativeCap, WAD),
+    ErrorsLib.RelativeCapExceeded()
+);
+```
+
+| Field | Unit | Notes |
+|---|---|---|
+| `absoluteCap` | uint256 in the vault asset's native decimals (e.g., USDC: 6 decimals) | **Must be > 0 for every id** the adapter returns, otherwise `allocate` reverts. Stored on-chain as `uint128` (`uint256` in the API for headroom). |
+| `relativeCap` | uint256 in **WAD** (`1e18` = 100%). Example: 50% = `5e17`. | **NOT basis points.** The sentinel `relativeCap == WAD` means "no relative cap" and short-circuits the check. `relativeCap == 0` means `allocation <= 0` — effectively forbids the market. The bot must default new managed markets to a real WAD value (e.g. `WAD` for "unlimited" or `5e17` for 50%), never 0. |
 
 > **No `realAssets()` per market — the bot reads `vault.allocation(id)` instead.**
 
