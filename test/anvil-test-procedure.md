@@ -20,21 +20,18 @@ Estimated time: ~10 minutes the first time (mostly finding real Morpho Blue mark
 - [ ] Bun installed (`bun --version`)
 - [ ] `git submodule update --init --recursive` done (forge-std present at `lib/forge-std`)
 - [ ] `bun install` done
-- [ ] An Ethereum **mainnet** RPC URL with archive access (Alchemy or Infura free tier is fine)
-- [ ] On branch `feat/v2-migration` (or any branch with the V2 migration merged) with a clean working tree
+- [ ] An Ethereum **mainnet** RPC URL with archive access (Alchemy or Infura free tier is fine) — used **only** by `anvil --fork-url` in Step 1, never by the bot itself
 
-Set this once for the rest of the procedure:
-
-```bash
-export MAINNET_RPC_URL="https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
-```
+> Throughout this procedure, `RPC_URL` always means the **local Anvil URL** (`http://127.0.0.1:8545`) — same name as the bot's env var in [`src/config/env.ts`](../src/config/env.ts). The upstream mainnet URL is pasted inline in Step 1 and never stored as a variable, to avoid accidentally pointing the bot at mainnet.
 
 ---
 
 ## Step 1 — Start Anvil in Terminal 1
 
+Replace `<YOUR_MAINNET_RPC_URL>` with your Alchemy/Infura mainnet endpoint:
+
 ```bash
-anvil --fork-url $MAINNET_RPC_URL --chain-id 1
+anvil --fork-url <YOUR_MAINNET_RPC_URL> --chain-id 1
 ```
 
 Leave this running. It listens on `http://127.0.0.1:8545` and prints 10 pre-funded accounts. We will use the first two:
@@ -307,7 +304,8 @@ After that, PR #3 has zero outstanding ship blockers and is ready to merge. Per 
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `forge script` reverts on the first call | `MAINNET_RPC_URL` is wrong, rate-limited, or doesn't have archive access | Use a different RPC (Alchemy free tier supports archive on mainnet) |
+| `forge script` reverts on the first call | The mainnet URL passed to `anvil --fork-url` (Step 1) is wrong, rate-limited, or lacks archive access | Restart Anvil with a different mainnet RPC (Alchemy free tier supports archive on mainnet) |
+| Bot or forge accidentally hits real mainnet | `RPC_URL` was set to your mainnet endpoint instead of `http://127.0.0.1:8545` | `export RPC_URL=http://127.0.0.1:8545` and re-run the failing command. The procedure never stores the mainnet URL as a variable for exactly this reason. |
 | `Refusing to start: market <label> has relativeCap == 0` | The script's `RELATIVE_CAP_WAD` was overridden to 0 somewhere | `unset RELATIVE_CAP_WAD` and re-run; default is `WAD` |
 | Bot startup error: `locally computed cap id [N] does not match adapter.ids(...)` | The `oracle` field in `managed-markets.anvil.json` doesn't match the real on-chain market | Re-run the cast call from Step 2 and copy the oracle exactly |
 | `WrongLoanToken(0, 0x..., USDC)` | A market in the JSON has a loanToken that isn't USDC | Pick a USDC market on app.morpho.org |
