@@ -9,12 +9,17 @@
  * Import restrictions: only types.ts, constants.ts, and irm.ts.
  */
 
-import type { Address } from "viem";
-import { BPS_DENOMINATOR } from "../../config/constants.js";
+import { encodeAbiParameters } from "viem";
+import {
+  BPS_DENOMINATOR,
+  WAD,
+  MARKET_PARAMS_ABI_COMPONENTS,
+} from "../../config/constants.js";
 import { projectSupplyAPY } from "./irm.js";
 import type {
-  AdapterState,
+  MarketAllocationState,
   MarketData,
+  MarketParams,
   RebalanceAction,
   StrategyConfig,
   VaultState,
@@ -30,15 +35,33 @@ const MAX_LIQUIDITY_SAFETY_FACTOR = 1;
 /** Floor for concentration penalty so it never goes below zero. */
 const MIN_CONCENTRATION_PENALTY = 0;
 
-/** Minimum score value — adapters scoring at or below this are ignored. */
+/** Minimum score value — markets scoring at or below this are ignored. */
 const MIN_SCORE = 0;
+
+// ---------------------------------------------------------------------------
+// Internal helper: encode MarketParams into ABI-encoded call data
+// ---------------------------------------------------------------------------
+
+/**
+ * ABI-encodes a MarketParams struct into the `bytes data` argument expected by
+ * vault.allocate and vault.deallocate.
+ *
+ * Construction: encodeAbiParameters([{ type: "tuple", components: [...] }], [marketParams])
+ * NEVER returns "0x" — every allocate/deallocate call must include a market target.
+ */
+function encodeMarketParams(marketParams: MarketParams): `0x${string}` {
+  return encodeAbiParameters(
+    [{ type: "tuple", components: MARKET_PARAMS_ABI_COMPONENTS }],
+    [marketParams]
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Exported helper: computeScore
 // ---------------------------------------------------------------------------
 
 /**
- * Compute a risk-adjusted score for a single adapter + market pair.
+ * Compute a risk-adjusted score for a single market.
  *
  * Formula (SPEC B1):
  *   score = projected_APY × liquidity_safety_factor × (1 - concentration_penalty)
@@ -48,16 +71,16 @@ const MIN_SCORE = 0;
  *   liquidity_safety_factor = min(1, availableLiquidity / (minLiquidityMultiplier × allocation))
  *   concentration_penalty   = max(0, (allocation / marketTotalSupply) - concentrationThreshold)
  *
- * Returns 0 for adapters that fail the liquidity floor (i.e. available
+ * Returns 0 for markets that fail the liquidity floor (i.e. available
  * liquidity < minLiquidityMultiplier × allocation).
  *
- * @param adapter     Current on-chain adapter state.
- * @param market      Market data for the adapter's underlying market.
- * @param allocation  Proposed allocation (in asset native decimals).
- * @param config      Strategy configuration.
+ * @param marketState  Current on-chain market allocation state.
+ * @param market       Market data for the underlying Morpho Blue market.
+ * @param allocation   Proposed allocation (in asset native decimals).
+ * @param config       Strategy configuration.
  */
 export function computeScore(
-  adapter: AdapterState,
+  marketState: MarketAllocationState,
   market: MarketData,
   allocation: bigint,
   config: StrategyConfig
@@ -65,8 +88,8 @@ export function computeScore(
   const { minLiquidityMultiplier, maxMarketConcentrationPct } = config;
 
   // --- Projected APY ----------------------------------------------------------
-  // supplyDelta = proposed allocation minus current allocation for this adapter
-  const supplyDelta = allocation - adapter.realAssets;
+  // supplyDelta = proposed allocation minus current allocation for this market
+  const supplyDelta = allocation - marketState.allocation;
   const projectedAPY = projectSupplyAPY(
     market.irmParams,
     market.totalSupply,
@@ -77,8 +100,6 @@ export function computeScore(
   if (projectedAPY <= MIN_SCORE) return MIN_SCORE;
 
   // --- Liquidity safety factor ------------------------------------------------
-  // liquidityFloor = minLiquidityMultiplier × allocation (in asset units)
-  // We compare bigint values, then convert to Number for the final factor.
   const allocationNum = Number(allocation);
   const availableLiquidityNum = Number(market.availableLiquidity);
 
@@ -95,7 +116,6 @@ export function computeScore(
   }
 
   // --- Concentration penalty --------------------------------------------------
-  // concentrationThreshold as a decimal (e.g. 10% → 0.10)
   const concentrationThreshold = maxMarketConcentrationPct / 100;
   const totalSupplyNum = Number(market.totalSupply);
 
@@ -117,43 +137,63 @@ export function computeScore(
 // ---------------------------------------------------------------------------
 
 /**
- * Clamp each adapter's target allocation to its absolute and relative caps.
- * Excess is silently capped — callers are responsible for redistributing or
- * leaving it idle (outside scope of this helper).
+ * Clamp each market's target allocation to the MOST RESTRICTIVE of its 3 caps.
  *
- * @param allocations   Proposed allocation map (adapter address → amount).
- * @param adapters      Adapter states carrying cap information.
+ * Per PLAN.md § Cap units:
+ *   - absoluteCap: hard ceiling in asset native decimals.
+ *   - relativeCap: soft ceiling as a fraction of totalAssets in WAD (1e18 = 100%).
+ *     - relativeCap == WAD → no relative cap (skip this clamp for that id).
+ *     - relativeCap == 0n  → market forbidden; clamp target to 0.
+ *
+ * For each market, we compute the minimum permitted amount across all 3 cap ids.
+ * Excess is silently capped.
+ *
+ * @param allocations   Proposed allocation map (market index → amount).
+ * @param marketStates  Market allocation states carrying cap information.
  * @param totalAssets   Total vault assets (used to enforce relative caps).
  * @returns             New allocation map with all caps enforced.
  */
 export function enforceCapConstraints(
-  allocations: Map<Address, bigint>,
-  adapters: AdapterState[],
+  allocations: Map<number, bigint>,
+  marketStates: MarketAllocationState[],
   totalAssets: bigint
-): Map<Address, bigint> {
-  const result = new Map<Address, bigint>();
+): Map<number, bigint> {
+  const result = new Map<number, bigint>();
 
-  for (const adapter of adapters) {
-    const proposed = allocations.get(adapter.address) ?? 0n;
+  for (let i = 0; i < marketStates.length; i++) {
+    const marketState = marketStates[i];
+    if (marketState === undefined) continue;
 
-    // --- Absolute cap ---
+    const proposed = allocations.get(i) ?? 0n;
     let capped = proposed;
-    if (adapter.absoluteCap > 0n && capped > adapter.absoluteCap) {
-      capped = adapter.absoluteCap;
-    }
 
-    // --- Relative cap ---
-    // relativeCap is stored in basis points (e.g. 5000 = 50%).
-    if (adapter.relativeCap > 0 && totalAssets > 0n) {
-      const relativeCapAmount =
-        (totalAssets * BigInt(adapter.relativeCap)) /
-        BigInt(BPS_DENOMINATOR);
-      if (capped > relativeCapAmount) {
-        capped = relativeCapAmount;
+    // Iterate all 3 cap ids — the most restrictive wins.
+    for (const { absoluteCap, relativeCap } of marketState.caps) {
+      // --- Absolute cap ---
+      if (absoluteCap > 0n && capped > absoluteCap) {
+        capped = absoluteCap;
       }
+
+      // --- Relative cap (WAD units, not basis points) ---
+      // relativeCap == WAD → no relative cap sentinel → skip this clamp.
+      // relativeCap == 0n  → market forbidden → clamp to 0.
+      if (relativeCap === 0n) {
+        // Market forbidden — defensively clamp to 0.
+        // (The bot should have refused to start — vault.ts assertStartupInvariants
+        //  throws on this condition — but we handle it defensively here too.)
+        capped = 0n;
+        break;
+      } else if (relativeCap !== WAD && totalAssets > 0n) {
+        // Compute the relative cap amount: totalAssets * relativeCap / WAD
+        const relativeCapAmount = (totalAssets * relativeCap) / WAD;
+        if (capped > relativeCapAmount) {
+          capped = relativeCapAmount;
+        }
+      }
+      // relativeCap == WAD → no clamp needed for this id.
     }
 
-    result.set(adapter.address, capped);
+    result.set(i, capped);
   }
 
   return result;
@@ -167,8 +207,8 @@ export function enforceCapConstraints(
  * Return true when the absolute drift between current and target is below the
  * configured threshold (expressed in basis points of total assets).
  *
- * @param current        Current allocation for an adapter.
- * @param target         Target allocation for an adapter.
+ * @param current        Current allocation for a market.
+ * @param target         Target allocation for a market.
  * @param total          Total vault assets.
  * @param thresholdBps   Drift threshold in basis points.
  */
@@ -191,20 +231,20 @@ export function isWithinDriftThreshold(
 // ---------------------------------------------------------------------------
 
 /**
- * Build a positional lookup table: adapter address → MarketData.
+ * Build a positional lookup table: market index → MarketData.
  *
- * ChainReader populates VaultState such that state.adapters[i] corresponds to
- * state.markets[i].  We preserve that mapping here.
+ * ChainReader populates VaultState such that state.marketStates[i] corresponds
+ * to state.marketData[i]. We preserve that positional mapping here.
  */
-function buildAdapterMarketMap(
-  adapters: AdapterState[],
-  markets: MarketData[]
-): Map<Address, MarketData> {
-  const map = new Map<Address, MarketData>();
-  for (let i = 0; i < adapters.length; i++) {
-    const market = markets[i];
-    if (market !== undefined) {
-      map.set(adapters[i].address, market);
+function buildMarketDataMap(
+  marketStates: MarketAllocationState[],
+  marketDataArray: MarketData[]
+): Map<number, MarketData> {
+  const map = new Map<number, MarketData>();
+  for (let i = 0; i < marketStates.length; i++) {
+    const data = marketDataArray[i];
+    if (data !== undefined) {
+      map.set(i, data);
     }
   }
   return map;
@@ -218,15 +258,18 @@ function buildAdapterMarketMap(
  * Compute the ordered list of rebalance actions for a given vault snapshot.
  *
  * Steps:
- *   1. Score each adapter using projected post-rebalance APY, liquidity
+ *   1. Score each market using projected post-rebalance APY, liquidity
  *      safety factor, and concentration penalty.
  *   2. Compute proportional target allocations from relative scores.
- *   3. Enforce absolute and relative cap constraints (clamp, no redistribution).
- *   4. Compute per-adapter deltas (target − current).
- *   5. Filter out adapters whose |delta| is within the drift threshold.
+ *   3. Enforce cap constraints per-market using the most restrictive of the
+ *      3 cap ids (absolute + WAD-based relative caps).
+ *   4. Compute per-market deltas (target − current).
+ *   5. Filter out markets whose |delta| is within the drift threshold.
+ *      Exception: if relativeCap == 0 and market has allocation, always emit
+ *      a deallocate action.
  *   6. Return deallocate actions first, then allocate actions.
  *
- * Returns an empty array when no adapter exceeds the drift threshold, or when
+ * Returns an empty array when no market exceeds the drift threshold, or when
  * inputs are invalid.
  *
  * @param state   Complete vault snapshot from ChainReader.
@@ -236,29 +279,32 @@ export function computeRebalance(
   state: VaultState,
   config: StrategyConfig
 ): RebalanceAction[] {
-  const { adapters, markets, totalAssets } = state;
+  const { marketStates, marketData, totalAssets, adapterAddress } = state;
 
-  if (adapters.length === 0 || totalAssets === 0n) return [];
+  if (marketStates.length === 0 || totalAssets === 0n) return [];
 
-  // Build positional adapter → market lookup.
-  const adapterMarketMap = buildAdapterMarketMap(adapters, markets);
+  // Build positional market index → MarketData lookup.
+  const marketDataMap = buildMarketDataMap(marketStates, marketData);
 
   // -------------------------------------------------------------------------
-  // Step 1: Score each adapter
+  // Step 1: Score each market
   // -------------------------------------------------------------------------
-  const scores = new Map<Address, number>();
+  const scores = new Map<number, number>();
 
-  for (const adapter of adapters) {
-    const market = adapterMarketMap.get(adapter.address);
-    if (market === undefined) {
-      // No market data — score zero, adapter will not receive new allocation.
-      scores.set(adapter.address, 0);
+  for (let i = 0; i < marketStates.length; i++) {
+    const marketState = marketStates[i];
+    if (marketState === undefined) continue;
+
+    const data = marketDataMap.get(i);
+    if (data === undefined) {
+      // No market data — score zero, market will not receive new allocation.
+      scores.set(i, 0);
       continue;
     }
 
     // Use current allocation as the candidate allocation for scoring.
-    const score = computeScore(adapter, market, adapter.realAssets, config);
-    scores.set(adapter.address, score);
+    const score = computeScore(marketState, data, marketState.allocation, config);
+    scores.set(i, score);
   }
 
   // -------------------------------------------------------------------------
@@ -266,17 +312,17 @@ export function computeRebalance(
   // -------------------------------------------------------------------------
   const totalScore = Array.from(scores.values()).reduce((s, v) => s + v, 0);
 
-  const rawTargets = new Map<Address, bigint>();
+  const rawTargets = new Map<number, bigint>();
 
   if (totalScore <= 0) {
-    // All scores are zero — distribute equally among adapters that have caps.
-    const equalShare = totalAssets / BigInt(adapters.length);
-    for (const adapter of adapters) {
-      rawTargets.set(adapter.address, equalShare);
+    // All scores are zero — distribute equally among markets.
+    const equalShare = totalAssets / BigInt(marketStates.length);
+    for (let i = 0; i < marketStates.length; i++) {
+      rawTargets.set(i, equalShare);
     }
   } else {
-    for (const adapter of adapters) {
-      const score = scores.get(adapter.address) ?? 0;
+    for (let i = 0; i < marketStates.length; i++) {
+      const score = scores.get(i) ?? 0;
       // target = totalAssets × (score / totalScore)
       // Scale score by 1e18 to retain precision in bigint integer division.
       const scoreScaled = BigInt(Math.round(score * 1e18));
@@ -285,14 +331,14 @@ export function computeRebalance(
         totalScoreScaled > 0n
           ? (totalAssets * scoreScaled) / totalScoreScaled
           : 0n;
-      rawTargets.set(adapter.address, target);
+      rawTargets.set(i, target);
     }
   }
 
   // -------------------------------------------------------------------------
-  // Step 3: Enforce cap constraints
+  // Step 3: Enforce cap constraints (most restrictive of 3 cap ids, WAD math)
   // -------------------------------------------------------------------------
-  const cappedTargets = enforceCapConstraints(rawTargets, adapters, totalAssets);
+  const cappedTargets = enforceCapConstraints(rawTargets, marketStates, totalAssets);
 
   // -------------------------------------------------------------------------
   // Step 4 & 5: Compute deltas and filter by drift threshold
@@ -300,9 +346,28 @@ export function computeRebalance(
   const deallocateActions: RebalanceAction[] = [];
   const allocateActions: RebalanceAction[] = [];
 
-  for (const adapter of adapters) {
-    const current = adapter.realAssets;
-    const target = cappedTargets.get(adapter.address) ?? 0n;
+  for (let i = 0; i < marketStates.length; i++) {
+    const marketState = marketStates[i];
+    if (marketState === undefined) continue;
+
+    const current = marketState.allocation;
+    const target = cappedTargets.get(i) ?? 0n;
+
+    // Special case: relativeCap == 0 on any cap means market is forbidden.
+    // If there is any existing allocation, emit a deallocate action regardless
+    // of the drift threshold.
+    const isForbidden = marketState.caps.some((cap) => cap.relativeCap === 0n);
+    if (isForbidden && current > 0n) {
+      const encodedData = encodeMarketParams(marketState.market.marketParams);
+      deallocateActions.push({
+        adapter: adapterAddress,
+        marketLabel: marketState.market.label,
+        direction: "deallocate",
+        amount: current,
+        data: encodedData,
+      });
+      continue;
+    }
 
     if (
       isWithinDriftThreshold(
@@ -315,23 +380,27 @@ export function computeRebalance(
       continue;
     }
 
+    const encodedData = encodeMarketParams(marketState.market.marketParams);
+
     if (current > target) {
       // Overweight — deallocate.
       const amount = current - target;
       deallocateActions.push({
-        adapter: adapter.address,
+        adapter: adapterAddress,
+        marketLabel: marketState.market.label,
         direction: "deallocate",
         amount,
-        data: "0x",
+        data: encodedData,
       });
     } else {
       // Underweight — allocate.
       const amount = target - current;
       allocateActions.push({
-        adapter: adapter.address,
+        adapter: adapterAddress,
+        marketLabel: marketState.market.label,
         direction: "allocate",
         amount,
-        data: "0x",
+        data: encodedData,
       });
     }
   }

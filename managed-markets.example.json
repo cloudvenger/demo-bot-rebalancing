@@ -1,0 +1,14 @@
+[
+  {
+    "_comment": "Sample managed-markets config for Morpho Vault V2 — USDC markets on Ethereum mainnet. All addresses below are placeholders. Verify the correct oracle and lltv values on https://app.morpho.org before use. loanToken must equal the vault's underlying asset (USDC for a USDC vault). lltv is a WAD integer string (1e18 = 100%). 860000000000000000 = 86%. Caps (absoluteCap / relativeCap) are NOT stored here — they are configured on-chain by the curator via vault.increaseAbsoluteCap / vault.increaseRelativeCap. The deploy script defaults relativeCap to WAD (1e18 = 100%, meaning 'no relative cap'). NEVER set relativeCap to 0 on-chain — the bot will refuse to start if any managed market has relativeCap == 0 on any of its 3 cap ids.",
+    "label": "USDC/WETH 86%",
+    "loanToken": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "collateralToken": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    "oracle": "0x0000000000000000000000000000000000000001",
+    "irm": "0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC",
+    "lltv": "860000000000000000",
+    "_collateralComment": "WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 (verified)",
+    "_oracleComment": "Replace 0x000...001 with the actual Morpho-verified USDC/WETH oracle — verify on https://app.morpho.org",
+    "_irmComment": "AdaptiveCurveIRM mainnet = 0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC (verified)"
+  }
+]

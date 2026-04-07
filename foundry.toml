@@ -2,5 +2,6 @@
 src = "script"
 out = "script/out"
 libs = ["lib"]
-evm_version = "paris"
+evm_version = "cancun"
 solc = "0.8.24"
+fs_permissions = [{ access = "read", path = "./" }]

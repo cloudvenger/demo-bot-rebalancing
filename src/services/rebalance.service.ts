@@ -13,7 +13,7 @@ import type { VaultReader } from "../core/chain/vault.js";
 import type { MorphoReader } from "../core/chain/morpho.js";
 import type { IExecutor } from "../core/chain/executor.js";
 import { computeRebalanceActions } from "../core/rebalancer/engine.js";
-import type { RebalanceResult, StrategyConfig } from "../core/rebalancer/types.js";
+import type { ManagedMarket, RebalanceResult, StrategyConfig } from "../core/rebalancer/types.js";
 import type { Notifier } from "./notifier.js";
 import type { Config } from "../config/env.js";
 
@@ -136,10 +136,13 @@ export class RebalanceService {
    *   - The EXECUTE phase fails (tx revert or submission error)
    *
    * Returns a `RebalanceResult` with empty `txHashes` when no rebalance is
-   * needed (all adapters within drift threshold).
+   * needed (all markets within drift threshold).
    *
    * The cycle lock (`isRunning`) is always released in the `finally` block —
    * even if an unhandled exception escapes a nested try/catch.
+   *
+   * Post-execution: re-reads vault state to populate `newAllocations` keyed
+   * by `marketLabel` (the human-readable market name).
    */
   async run(): Promise<RebalanceResult | null> {
     // ---- Cycle lock check --------------------------------------------------
@@ -157,8 +160,19 @@ export class RebalanceService {
 
       try {
         console.info(`${LOG_PREFIX} reading vault state`);
-        state = await this.vaultReader.readFullState();
-        state.markets = await this.morphoReader.readMarketsForAdapters(state.adapters);
+        const vaultState = await this.vaultReader.readFullState();
+
+        // MorphoReader reads market data for the active managed markets.
+        // The markets are in the same positional order as vaultState.marketStates.
+        const activeMarkets = this.vaultReader.activeMarkets;
+        const marketData = await this.morphoReader.readMarketsForManagedMarkets(
+          activeMarkets as ManagedMarket[]
+        );
+
+        state = {
+          ...vaultState,
+          marketData,
+        };
       } catch (readError) {
         // RPC failure after retries exhausted — alert and abort this cycle.
         const message = readError instanceof Error ? readError.message : String(readError);
@@ -196,13 +210,24 @@ export class RebalanceService {
         const result = await this.executor.execute(actions, this.vaultAddress);
 
         this.lastRebalanceTimestamp = new Date();
-        this.lastRebalanceResult = result;
+
+        // ---- Post-execute: re-read state for newAllocations -----------------
+        // Re-read vault state to get the actual post-rebalance allocations.
+        // These are keyed by marketLabel (human-readable) per the new API shape.
+        const newAllocations = await this._readNewAllocations(result.txHashes.length > 0);
+
+        const finalResult: RebalanceResult = {
+          ...result,
+          newAllocations,
+        };
+
+        this.lastRebalanceResult = finalResult;
 
         console.info(`${LOG_PREFIX} rebalance complete — ${result.txHashes.length} tx(s) submitted`);
 
         // ---- NOTIFY phase (fire-and-forget) ---------------------------------
         try {
-          await this.notifier.notifyRebalanceSuccess(result, this.vaultAddress);
+          await this.notifier.notifyRebalanceSuccess(finalResult, this.vaultAddress);
         } catch (notifyErr) {
           // Telegram failure — log locally, never block.
           console.warn(
@@ -211,7 +236,7 @@ export class RebalanceService {
           );
         }
 
-        return result;
+        return finalResult;
       } catch (execError) {
         // tx revert or execution error — alert and return null.
         const safeError =
@@ -251,6 +276,41 @@ export class RebalanceService {
       lastRebalanceResult: this.lastRebalanceResult,
       isRunning: this.isRunning,
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Private helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Read the current vault state and compute allocation percentages by
+   * marketLabel, to populate `newAllocations` in the final RebalanceResult.
+   *
+   * If the re-read fails (e.g. RPC error), returns an empty array — the
+   * rebalance itself was still successful and we do not want to fail the
+   * overall result.
+   *
+   * @param didExecute  Whether transactions were actually submitted. If not
+   *                    (dry-run or no-op), we still compute allocations from
+   *                    the current on-chain state.
+   */
+  private async _readNewAllocations(
+    _didExecute: boolean
+  ): Promise<Array<{ marketLabel: string; percentage: number }>> {
+    try {
+      const postState = await this.vaultReader.readFullState();
+
+      return postState.marketStates.map((ms) => ({
+        marketLabel: ms.market.label,
+        percentage:
+          postState.totalAssets > 0n
+            ? Number((ms.allocation * 10_000n) / postState.totalAssets) / 100
+            : 0,
+      }));
+    } catch {
+      // Re-read failed — return empty rather than failing the whole result.
+      return [];
+    }
   }
 }
 
@@ -293,4 +353,3 @@ function buildNoOpResult(): RebalanceResult {
     timestamp: new Date().toISOString(),
   };
 }
-

@@ -5,7 +5,7 @@ import {
   WAD,
   SECONDS_PER_YEAR,
 } from "../../config/constants.js";
-import type { AdapterState, IRMParams, MarketData } from "../rebalancer/types.js";
+import type { IRMParams, ManagedMarket, MarketData } from "../rebalancer/types.js";
 import type { BotPublicClient } from "./client.js";
 
 // ---------------------------------------------------------------------------
@@ -151,6 +151,7 @@ function deriveIRMParams(
  * ```ts
  * const reader = new MorphoReader(publicClient);
  * const market = await reader.readMarketData(marketId);
+ * const markets = await reader.readMarketsForManagedMarkets(managedMarkets);
  * ```
  */
 export class MorphoReader {
@@ -289,64 +290,29 @@ export class MorphoReader {
   }
 
   /**
-   * Batch-reads market data for a list of adapters.
+   * Batch-reads market data for a list of managed markets.
    *
-   * Only reads market data for `"morpho-market-v1"` adapters; vault adapters
-   * (`"morpho-vault-v1"`) do not have an associated Morpho Blue market ID and
-   * are skipped.
+   * Uses the `marketId` field on each `ManagedMarket` (derived at startup from
+   * the MarketParams keccak256 hash) to read the on-chain Morpho Blue market
+   * state for each configured market.
    *
-   * The market ID is read from the adapter's `marketId()` getter when the
-   * adapter is of type `"morpho-market-v1"`.
+   * The returned array is positionally paired with the input array:
+   *   result[i] corresponds to managedMarkets[i].
    *
-   * @param adapters  AdapterState array (already populated by VaultReader).
-   * @returns Array of MarketData in the same order as market-type adapters.
+   * Markets that fail to read are returned as null and excluded from the result,
+   * so a single bad market does not fail the entire batch.
+   *
+   * @param managedMarkets  Active managed markets (from VaultReader.activeMarkets).
+   * @returns Array of MarketData in the same order as managedMarkets.
    */
-  async readMarketsForAdapters(adapters: AdapterState[]): Promise<MarketData[]> {
-    const marketAdapters = adapters.filter(
-      (a) => a.adapterType === "morpho-market-v1"
-    );
-
-    if (marketAdapters.length === 0) {
+  async readMarketsForManagedMarkets(managedMarkets: ManagedMarket[]): Promise<MarketData[]> {
+    if (managedMarkets.length === 0) {
       return [];
     }
 
-    // ------------------------------------------------------------------
-    // Step 1: read the marketId() from each market adapter
-    // ------------------------------------------------------------------
-    const marketIdCalls = marketAdapters.map((adapter) => ({
-      address: adapter.address,
-      abi: [
-        {
-          name: "marketId",
-          type: "function",
-          stateMutability: "view",
-          inputs: [],
-          outputs: [{ name: "", type: "bytes32" }],
-        },
-      ] as const,
-      functionName: "marketId" as const,
-    }));
-
-    const marketIdResults = await withRetry(
-      () =>
-        this.publicClient.multicall({
-          contracts: marketIdCalls,
-          allowFailure: true,
-        }),
-      "MorphoReader.readMarketsForAdapters — read marketIds"
-    );
-
-    // ------------------------------------------------------------------
-    // Step 2: read market data for each successfully resolved market ID
-    // ------------------------------------------------------------------
-    const marketDataPromises = marketIdResults.map(async (result, i) => {
-      if (result.status === "failure" || !result.result) {
-        // Adapter did not expose marketId() — skip it.
-        return null;
-      }
-
+    const marketDataPromises = managedMarkets.map(async (market) => {
       try {
-        return await this.readMarketData(result.result as Hash);
+        return await this.readMarketData(market.marketId);
       } catch {
         // Individual market read failed — skip rather than failing the batch.
         return null;
@@ -355,7 +321,7 @@ export class MorphoReader {
 
     const settled = await Promise.all(marketDataPromises);
 
-    // Filter out nulls (adapters that could not be resolved).
+    // Filter out nulls (markets that could not be resolved).
     return settled.filter((d): d is MarketData => d !== null);
   }
 }
