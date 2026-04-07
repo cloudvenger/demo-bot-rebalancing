@@ -16,8 +16,8 @@ import type { RebalanceAction, StrategyConfig, VaultState } from "./types.js";
 // Named constants
 // ---------------------------------------------------------------------------
 
-/** Minimum number of adapters required to attempt a rebalance. */
-const MIN_ADAPTER_COUNT = 1;
+/** Minimum number of managed markets required to attempt a rebalance. */
+const MIN_MARKET_COUNT = 1;
 
 // ---------------------------------------------------------------------------
 // Exported entry point
@@ -28,10 +28,10 @@ const MIN_ADAPTER_COUNT = 1;
  *
  * Validates that:
  *   - totalAssets is non-zero
- *   - at least one adapter is present
+ *   - at least one managed market is present in marketStates
  *
  * Returns an empty array (never throws) when inputs are invalid or when no
- * rebalance is needed (all adapters within drift threshold).
+ * rebalance is needed (all markets within drift threshold).
  *
  * Deallocate actions are guaranteed to precede allocate actions in the
  * returned array, matching the on-chain execution requirement (SPEC B2).
@@ -49,7 +49,7 @@ export function computeRebalanceActions(
     return [];
   }
 
-  if (state.adapters.length < MIN_ADAPTER_COUNT) {
+  if (state.marketStates.length < MIN_MARKET_COUNT) {
     return [];
   }
 

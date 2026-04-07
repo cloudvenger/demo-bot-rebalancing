@@ -86,24 +86,24 @@
 
 ### 8.1 — Config + types (sequential, first)
 
-- [ ] [backend] Update [src/config/env.ts](src/config/env.ts) — add `ADAPTER_ADDRESS` (required Address) and `MANAGED_MARKETS_PATH` (required string)
-- [ ] [backend] Create `src/config/managed-markets.ts` — load + zod-validate the JSON file referenced by `MANAGED_MARKETS_PATH` into a `ManagedMarket[]`
-- [ ] [backend] Create `.env.example` entries for `ADAPTER_ADDRESS` and `MANAGED_MARKETS_PATH`, and add a sample `managed-markets.example.json` (sample uses `relativeCap: "1000000000000000000"` (= WAD) to demonstrate the "no relative cap" default — never `0`)
-- [ ] [backend] Rewrite [src/core/rebalancer/types.ts](src/core/rebalancer/types.ts):
+- [x] [backend] Update [src/config/env.ts](src/config/env.ts) — add `ADAPTER_ADDRESS` (required Address) and `MANAGED_MARKETS_PATH` (required string)
+- [x] [backend] Create `src/config/managed-markets.ts` — load + zod-validate the JSON file referenced by `MANAGED_MARKETS_PATH` into a `ManagedMarket[]`
+- [x] [backend] Create `.env.example` entries for `ADAPTER_ADDRESS` and `MANAGED_MARKETS_PATH`, and add a sample `managed-markets.example.json` (sample uses `relativeCap: "1000000000000000000"` (= WAD) to demonstrate the "no relative cap" default — never `0`)
+- [x] [backend] Rewrite [src/core/rebalancer/types.ts](src/core/rebalancer/types.ts):
   - Remove `AdapterState`, `AdapterType`
   - Add `MarketParams`, `ManagedMarket`, `MarketAllocationState` (per PLAN.md § Domain Types)
   - Update `VaultState` to carry `adapterAddress` + `marketStates: MarketAllocationState[]` (paired with `marketData`)
   - Update `RebalanceAction` to add `marketLabel` and document that `data` is always ABI-encoded `MarketParams` and `adapter` is always the configured single adapter
   - Update `RebalanceResult.newAllocations` to be keyed by `marketLabel`, not `adapter`
   - **Cap units**: store `absoluteCap` and `relativeCap` as `bigint` (uint256). `relativeCap` is in **WAD** (`1e18` = 100%), not basis points. Document the `relativeCap == WAD` "no cap" sentinel and the `relativeCap == 0` "forbid" trap. (See PLAN.md § Cap units.)
-- [ ] [qa] Update tests for env.ts to cover the new required fields
-- [ ] [qa] Add tests for `managed-markets.ts` — valid JSON, missing fields, invalid `MarketParams` shape
+- [x] [qa] Update tests for env.ts to cover the new required fields
+- [x] [qa] Add tests for `managed-markets.ts` — valid JSON, missing fields, invalid `MarketParams` shape
 
 ### 8.2 — Chain reading layer (sequential, after 8.1)
 
-- [ ] [backend] Update [src/config/constants.ts](src/config/constants.ts) — fix the `VAULT_V2_ABI` to expose the real signatures: `totalAssets`, `adaptersLength`, `adaptersAt`, `absoluteCap(bytes32)`, `relativeCap(bytes32)`, `allocation(bytes32)`, `isAllocator(address)`, and the 3-arg `allocate` / `deallocate`. Remove the wrong `caps(bytes32)` tuple entry.
-- [ ] [backend] Update `ADAPTER_ABI` to expose `ids(MarketParams) returns (bytes32[3])`, `allocation(MarketParams) returns (uint256)`, `parentVault() returns (address)`. Remove `realAssets()`.
-- [ ] [backend] Rewrite [src/core/chain/vault.ts](src/core/chain/vault.ts):
+- [x] [backend] Update [src/config/constants.ts](src/config/constants.ts) — fix the `VAULT_V2_ABI` to expose the real signatures: `totalAssets`, `adaptersLength`, `adaptersAt`, `absoluteCap(bytes32)`, `relativeCap(bytes32)`, `allocation(bytes32)`, `isAllocator(address)`, and the 3-arg `allocate` / `deallocate`. Remove the wrong `caps(bytes32)` tuple entry.
+- [x] [backend] Update `ADAPTER_ABI` to expose `ids(MarketParams) returns (bytes32[3])`, `allocation(MarketParams) returns (uint256)`, `parentVault() returns (address)`. Remove `realAssets()`.
+- [x] [backend] Rewrite [src/core/chain/vault.ts](src/core/chain/vault.ts):
   - Constructor takes `(publicClient, vaultAddress, adapterAddress, managedMarkets)`
   - At startup: assert the configured adapter is enabled (enumerate `adaptersAt` over `adaptersLength`), assert `adapter.parentVault() == vaultAddress`, assert `vault.isAllocator(botWallet) == true`
   - **At startup, for every managed market, read `vault.relativeCap(id)` for all 3 ids and refuse to start if any returns `0n`.** Throw a `StartupValidationError` with the exact message format from SPEC Story A2: `"Refusing to start: market <label> has relativeCap == 0 on cap id <id>. This forbids any allocation to this market. If you meant 'no relative cap', set relativeCap to WAD (1e18). If you meant to forbid this market, remove it from MANAGED_MARKETS."` Markets with `absoluteCap == 0` on any id are silently excluded from the rebalance loop and logged as `"ignored: no absolute cap configured"` (per SPEC Story A2).
@@ -112,30 +112,30 @@
   - Compute all 3 ids off-chain in TypeScript using viem `encodeAbiParameters` + `keccak256`, with the verified preimages from PLAN.md § Verified cap-id preimages. At startup, assert that the locally computed ids match `adapter.ids(marketParams)` exactly — if any mismatch, abort.
   - Drop `resolveAdapterType` — there is only one adapter type to support in v1
   - Return `VaultState` with the new shape (per PLAN.md)
-- [ ] [qa] Update `test/integration/chain-reader.test.ts` against an Anvil fork with a fresh-deployed vault + adapter + managed markets — verify allocation reads, cap reads, startup assertions
+- [x] [qa] Update `test/integration/chain-reader.test.ts` against an Anvil fork with a fresh-deployed vault + adapter + managed markets — verify allocation reads, cap reads, startup assertions
 
 ### 8.3 — Strategy + executor (sequential, after 8.2)
 
-- [ ] [backend] Update [src/core/rebalancer/strategy.ts](src/core/rebalancer/strategy.ts):
+- [x] [backend] Update [src/core/rebalancer/strategy.ts](src/core/rebalancer/strategy.ts):
   - Iterate `state.marketStates` instead of `state.adapters`
   - Cap enforcement now clamps against the **most restrictive** of the 3 ids per market (not a single `absoluteCap` field)
   - **Fix the relativeCap math**: use `WAD = 10n ** 18n` as the divisor, not `BPS_DENOMINATOR`. Compute `relativeCapAmount = (totalAssets * relativeCap) / WAD`. Treat `relativeCap == WAD` as "no relative cap" (skip the clamp). Treat `relativeCap == 0n` as "market forbidden" — clamp the target to 0 and emit a deallocate-only action if currently allocated.
   - Emit `RebalanceAction` with `data = encodeMarketParams(marketParams)` and `marketLabel = market.label`
   - Math (`computeScore`, `projectSupplyAPY`, `isWithinDriftThreshold`) is unchanged
-- [ ] [backend] Fix [src/core/chain/executor.ts](src/core/chain/executor.ts):
+- [x] [backend] Fix [src/core/chain/executor.ts](src/core/chain/executor.ts):
   - Change the `writeContract` call to pass exactly 3 args: `[action.adapter, action.data, action.amount]` — remove `ZERO_SELECTOR`
   - Drop the `ZERO_SELECTOR` constant
   - Log/alert messages should reference `action.marketLabel` rather than `action.adapter`
-- [ ] [backend] Update [src/services/notifier.ts](src/services/notifier.ts) — message templates use `marketLabel` instead of adapter address
-- [ ] [backend] Update [src/services/rebalance.service.ts](src/services/rebalance.service.ts) — pass `adapterAddress` from `VaultState` to executor; populate `newAllocations` from a post-rebalance re-read keyed by `marketLabel`
-- [ ] [backend] Update [src/plugins/api.ts](src/plugins/api.ts) — `/api/v1/status` returns the new shape per PLAN.md (markets array, 3 caps per market, adapterAddress field)
-- [ ] [qa] Rewrite `test/unit/strategy.test.ts` — exercise per-market scoring, multi-id cap clamping, drift threshold across markets
-- [ ] [qa] Rewrite `test/integration/executor.test.ts` against Anvil fork — verify 3-arg `allocate` / `deallocate` succeed end-to-end on a real vault
-- [ ] [qa] Update `test/integration/api.test.ts` — assert the new `/api/v1/status` shape
+- [x] [backend] Update [src/services/notifier.ts](src/services/notifier.ts) — message templates use `marketLabel` instead of adapter address
+- [x] [backend] Update [src/services/rebalance.service.ts](src/services/rebalance.service.ts) — pass `adapterAddress` from `VaultState` to executor; populate `newAllocations` from a post-rebalance re-read keyed by `marketLabel`
+- [x] [backend] Update [src/plugins/api.ts](src/plugins/api.ts) — `/api/v1/status` returns the new shape per PLAN.md (markets array, 3 caps per market, adapterAddress field)
+- [x] [qa] Rewrite `test/unit/strategy.test.ts` — exercise per-market scoring, multi-id cap clamping, drift threshold across markets
+- [x] [qa] Rewrite `test/integration/executor.test.ts` against Anvil fork — verify 3-arg `allocate` / `deallocate` succeed end-to-end on a real vault
+- [x] [qa] Update `test/integration/api.test.ts` — assert the new `/api/v1/status` shape
 
 ### 8.4 — Deployment script + tutorial (parallel within 8.4, after 8.1; can run alongside 8.2/8.3)
 
-- [ ] [docs] Rewrite [script/DeployVault.s.sol](script/DeployVault.s.sol) end-to-end:
+- [x] [docs] Rewrite [script/DeployVault.s.sol](script/DeployVault.s.sol) end-to-end:
   - `createVaultV2(owner, USDC, salt)` — owner, asset, salt order; no name/symbol
   - `createMorphoMarketV1AdapterV2(vault)` — single adapter, no MarketParams
   - `vault.setCurator(curator)` (owner-only, not timelocked)
@@ -145,11 +145,11 @@
   - The script must `console.log` a final summary including the `relativeCap` value used per market in both raw WAD and human-readable percent, so operators visually catch unintended `0` values before broadcasting on mainnet.
   - Read managed markets from a JSON file via `vm.readFile` + `vm.parseJsonAddress` etc., or from env vars
   - Log the deployed `vault`, `adapter`, and the resulting `managed-markets.json` content the operator should copy into the bot config
-- [ ] [docs] Rewrite [script/README.md](script/README.md) — explain the curator role, the timelock=0 default, the multicall flow, and the env vars (`OWNER`, `BOT_WALLET`, `MANAGED_MARKETS_JSON`, etc.)
-- [ ] [docs] Rewrite [docs/rebalancing/vault-setup-guide.md](docs/rebalancing/vault-setup-guide.md) — explain the role model, single-adapter architecture, and how the bot's `MANAGED_MARKETS_PATH` config relates to the cap ids set by the curator
+- [x] [docs] Rewrite [script/README.md](script/README.md) — explain the curator role, the timelock=0 default, the multicall flow, and the env vars (`OWNER`, `BOT_WALLET`, `MANAGED_MARKETS_JSON`, etc.)
+- [x] [docs] Rewrite [docs/rebalancing/vault-setup-guide.md](docs/rebalancing/vault-setup-guide.md) — explain the role model, single-adapter architecture, and how the bot's `MANAGED_MARKETS_PATH` config relates to the cap ids set by the curator
 
 ### 8.5 — Quality gate (sequential, last)
 
-- [ ] [qa] Run `just check` (lint + typecheck + unit tests)
-- [ ] [qa] Run integration tests against a fresh Anvil fork with the new deployment script
-- [ ] [qa] Dry-run the bot end-to-end (`DRY_RUN=true`) against the Anvil-deployed vault and verify it reads state, scores markets, and proposes actions correctly
+- [x] [qa] Run `just check` (lint + typecheck + unit tests) — **PASSED** 2026-04-07: 12 test files, 398 passed, 14 Anvil-skipped, full project typecheck clean
+- [ ] [qa] Run integration tests against a fresh Anvil fork with the new deployment script — *deferred*: requires Anvil + RPC; gated tests written and ready to run when ANVIL_RPC_URL is set
+- [ ] [qa] Dry-run the bot end-to-end (`DRY_RUN=true`) against the Anvil-deployed vault and verify it reads state, scores markets, and proposes actions correctly — *deferred*: same Anvil dependency

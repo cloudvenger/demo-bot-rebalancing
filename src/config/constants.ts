@@ -1,4 +1,5 @@
 import { parseAbi } from "viem";
+import type { AbiParameter } from "viem";
 
 // ---------------------------------------------------------------------------
 // Chain
@@ -15,59 +16,154 @@ export const CONTRACT_ADDRESSES = {
   /** Morpho Vault V2 factory */
   VaultV2Factory: "0xA1D94F746dEfa1928926b84fB2596c06926C0405",
 
-  /** Factory for MorphoMarketV1AdapterV2 (market adapters) */
+  /** Factory for MorphoMarketV1AdapterV2 (single adapter per vault) */
   MorphoMarketV1AdapterV2Factory: "0x32BB1c0D48D8b1B3363e86eeB9A0300BAd61ccc1",
 
-  /** Factory for MorphoVaultV1Adapter (vault adapters) */
-  MorphoVaultV1AdapterFactory: "0xD1B8E2dee25c2b89DCD2f98448a7ce87d6F63394",
-
-  /** Public Allocator V1 — permissionless rebalance helper */
-  PublicAllocator: "0xfd32fA2ca22c76dD6E550706Ad913FC6CE91c75D",
+  /**
+   * AdaptiveCurveIRM — the only IRM supported by MorphoMarketV1AdapterV2.
+   * The adapter enforces that every routed market uses this IRM address.
+   * Source: PLAN.md § Key Contract Addresses
+   */
+  AdaptiveCurveIRM: "0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC",
 
   /** USD Coin (USDC) ERC-20 on mainnet */
   USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
 } as const satisfies Record<string, `0x${string}`>;
 
 // ---------------------------------------------------------------------------
-// Vault V2 ABI — minimal interface for bot operations
+// MarketParams ABI components
+// ---------------------------------------------------------------------------
+
+/**
+ * ABI parameter components for the on-chain MarketParams struct.
+ *
+ * Used in three places:
+ *   1. encodeAbiParameters([{ type: "tuple", components: ... }], [marketParams])
+ *      — to compute marketId (keccak256 of encoded MarketParams)
+ *   2. encodeAbiParameters for cap-id preimage #2 ("this/marketParams")
+ *   3. As the argument type for adapter.ids(MarketParams) in ADAPTER_ABI
+ *
+ * Field order must match the on-chain Morpho Blue struct exactly:
+ *   (loanToken, collateralToken, oracle, irm, lltv)
+ *
+ * Exported so VaultReader and any other module needing ABI encoding of
+ * MarketParams can import a single authoritative definition.
+ */
+export const MARKET_PARAMS_ABI_COMPONENTS = [
+  { name: "loanToken", type: "address" },
+  { name: "collateralToken", type: "address" },
+  { name: "oracle", type: "address" },
+  { name: "irm", type: "address" },
+  { name: "lltv", type: "uint256" },
+] as const satisfies readonly AbiParameter[];
+
+// ---------------------------------------------------------------------------
+// Vault V2 ABI — verified against morpho-org/vault-v2 source (2026-04-07)
 // ---------------------------------------------------------------------------
 
 /**
  * Minimal Vault V2 ABI.
  *
+ * All signatures are verified against the real on-chain contract.
+ * Removed from previous version:
+ *   - caps(bytes32) tuple — does NOT exist on the real contract (was wrong)
+ *   - 4-arg allocate/deallocate — V2 uses 3 args, no bytes4 selector
+ *
  * Functions included:
- *   - totalAssets()           — total assets under management
- *   - allocate(...)           — push assets from idle pool to adapter
- *   - deallocate(...)         — pull assets from adapter to idle pool
- *   - adaptersAt(uint256)     — enumerate enabled adapters by index
- *   - adaptersLength()        — total number of enabled adapters
- *   - caps(bytes32)           — absolute + relative cap for a risk ID
+ *   Reads:
+ *     totalAssets()               — total assets under management
+ *     adaptersLength()            — count of enabled adapters (startup check)
+ *     adaptersAt(uint256)         — adapter address at index (startup check)
+ *     absoluteCap(bytes32)        — hard ceiling for a cap id (in asset decimals)
+ *     relativeCap(bytes32)        — soft ceiling in WAD (1e18 = 100%, NOT basis pts)
+ *     allocation(bytes32)         — current allocation accounted for a cap id
+ *     isAllocator(address)        — whether an address holds the allocator role
+ *   Writes:
+ *     allocate(adapter, data, assets)    — push assets to adapter (3 args)
+ *     deallocate(adapter, data, assets)  — pull assets from adapter (3 args)
+ *     multicall(bytes[])                 — used by curator setup script
  */
 export const VAULT_V2_ABI = parseAbi([
   // ---- Reads ---------------------------------------------------------------
   "function totalAssets() external view returns (uint256)",
-  "function adaptersAt(uint256 index) external view returns (address)",
   "function adaptersLength() external view returns (uint256)",
-  "function caps(bytes32 id) external view returns (uint256 absoluteCap, uint256 relativeCap)",
+  "function adaptersAt(uint256 index) external view returns (address)",
+  "function absoluteCap(bytes32 id) external view returns (uint256)",
+  "function relativeCap(bytes32 id) external view returns (uint256)",
+  "function allocation(bytes32 id) external view returns (uint256)",
+  "function isAllocator(address account) external view returns (bool)",
 
   // ---- Writes --------------------------------------------------------------
-  "function allocate(address adapter, bytes calldata data, uint256 assets, bytes4 selector) external",
-  "function deallocate(address adapter, bytes calldata data, uint256 assets, bytes4 selector) external",
+  // NOTE: 3 args — no bytes4 selector. Verified against vault-v2 source.
+  "function allocate(address adapter, bytes calldata data, uint256 assets) external",
+  "function deallocate(address adapter, bytes calldata data, uint256 assets) external returns (bytes32[])",
+  "function multicall(bytes[] calldata data) external returns (bytes[] memory)",
 ]);
 
 // ---------------------------------------------------------------------------
-// Adapter ABI — minimal interface shared by all adapter types
+// Adapter ABI — MorphoMarketV1AdapterV2 minimal interface
 // ---------------------------------------------------------------------------
 
 /**
- * Minimal adapter ABI.
+ * Minimal MorphoMarketV1AdapterV2 ABI.
+ *
+ * Removed from previous version:
+ *   - realAssets() — still exists on the real adapter but the bot must NOT use it.
+ *     Per PLAN.md § MorphoMarketV1AdapterV2: "the bot reads vault.allocation(id)
+ *     instead." Interface segregation: VaultReader reads vault state, not adapter
+ *     convenience views.
  *
  * Functions included:
- *   - realAssets() — current assets supplied through this adapter
+ *   ids(MarketParams)        — returns the 3 cap ids the vault checks during allocate
+ *   allocation(MarketParams) — convenience view for vault.allocation(marketSpecificId)
+ *   parentVault()            — used at startup to verify adapter belongs to configured vault
+ *   adapterId()              — adapter-wide cap id (keccak256("this", adapter))
+ *
+ * Note on ids() return type: the real Solidity signature returns bytes32[] (dynamic
+ * array of length 3), not bytes32[3] (fixed-size). viem requires the dynamic form.
  */
-export const ADAPTER_ABI = parseAbi([
-  "function realAssets() external view returns (uint256)",
-]);
+export const ADAPTER_ABI = [
+  {
+    name: "ids",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      {
+        name: "marketParams",
+        type: "tuple",
+        components: MARKET_PARAMS_ABI_COMPONENTS,
+      },
+    ],
+    outputs: [{ name: "", type: "bytes32[]" }],
+  },
+  {
+    name: "allocation",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      {
+        name: "marketParams",
+        type: "tuple",
+        components: MARKET_PARAMS_ABI_COMPONENTS,
+      },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    name: "parentVault",
+    type: "function",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "address" }],
+  },
+  {
+    name: "adapterId",
+    type: "function",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "bytes32" }],
+  },
+] as const;
 
 // ---------------------------------------------------------------------------
 // Morpho Blue ABI — minimal interface for market reads
@@ -97,21 +193,20 @@ export const MORPHO_BLUE_ABI = parseAbi([
 ]);
 
 // ---------------------------------------------------------------------------
-// Morpho Blue IRM ABI — Linear IRM (AdaptiveCurveIRM or LinearKinkIRM)
+// Morpho Blue IRM ABI — AdaptiveCurveIRM
 // ---------------------------------------------------------------------------
 
 /**
  * Minimal IRM ABI.
  *
- * The LinearKinkIRM (and compatible IRMs) expose individual rate parameter
- * getters.  We read these once per cycle and simulate projected APY off-chain.
+ * The AdaptiveCurveIRM exposes borrowRateView for projected-rate simulation.
+ * We read this once per cycle and compute projected APY off-chain in TypeScript.
  *
  * Functions included:
- *   - CURVE_STEEPNESS()       — steepness multiplier (AdaptiveCurveIRM)
- *   - borrowRateView(...)     — current borrow rate (WAD per second)
+ *   borrowRateView(marketParams, market) — current borrow rate (WAD per second)
  */
 export const IRM_ABI = parseAbi([
-  // AdaptiveCurveIRM — used by most Morpho Blue markets
+  // AdaptiveCurveIRM — used by all Morpho Blue markets managed by this bot
   "function borrowRateView((address loanToken, address collateralToken, address oracle, address irm, uint256 lltv) marketParams, (uint128 totalSupplyAssets, uint128 totalSupplyShares, uint128 totalBorrowAssets, uint128 totalBorrowShares, uint128 lastUpdate, uint128 fee) market) external view returns (uint256)",
 ]);
 
@@ -133,8 +228,19 @@ export const ERC20_ABI = parseAbi([
 /** Basis points denominator (10 000 = 100%) */
 export const BPS_DENOMINATOR = 10_000 as const;
 
-/** WAD precision (1e18) — used by viem/Morpho rate arithmetic */
-export const WAD: bigint = BigInt("1000000000000000000");
+/**
+ * WAD precision (1e18 = 100%).
+ *
+ * Used for:
+ *   - relativeCap units on-chain (relativeCap == WAD means "no relative cap")
+ *   - lltv values in MarketParams
+ *   - IRM rate arithmetic
+ *
+ * IMPORTANT: relativeCap is stored in WAD, NOT in basis points. Do not cast
+ * relativeCap to Number — WAD values are uint256 and would lose precision.
+ * relativeCap == 0n means "market forbidden" (allocation must be 0).
+ */
+export const WAD: bigint = 1_000_000_000_000_000_000n;
 
 /** Number of seconds in a year — used for APY annualisation */
 export const SECONDS_PER_YEAR: bigint = 365n * 24n * 60n * 60n;

@@ -11,12 +11,6 @@ import { VAULT_V2_ABI } from "../../config/constants.js";
 /** Conversion factor: 1 gwei = 1e9 wei */
 const GWEI_TO_WEI = 1_000_000_000n;
 
-/**
- * Sentinel selector value passed to allocate/deallocate when no specific
- * callback selector is needed. Matches the Vault V2 convention of `bytes4(0)`.
- */
-const ZERO_SELECTOR = "0x00000000" as const;
-
 // ---------------------------------------------------------------------------
 // Interface
 // ---------------------------------------------------------------------------
@@ -47,6 +41,9 @@ export interface IExecutor {
  *
  * The caller is responsible for ordering actions correctly (deallocates first,
  * allocates second). This class preserves that order exactly.
+ *
+ * vault.allocate / vault.deallocate are 3-arg: (adapter, data, assets).
+ * There is no bytes4 selector argument in Vault V2.
  */
 export class Executor implements IExecutor {
   private readonly walletClient: BotWalletClient;
@@ -71,8 +68,9 @@ export class Executor implements IExecutor {
    *      return immediately with an empty result and a reason string.
    *   2. If `config.dryRun` is true, log actions and return a mock result
    *      without submitting any transaction.
-   *   3. Submit each action as a `writeContract` call, then wait for its
-   *      receipt. On revert, stop and return a partial result.
+   *   3. Submit each action as a `writeContract` call with exactly 3 args:
+   *      [action.adapter, action.data, action.amount].
+   *      Then wait for its receipt. On revert, stop and return a partial result.
    */
   async execute(
     actions: RebalanceAction[],
@@ -107,11 +105,13 @@ export class Executor implements IExecutor {
 
       let txHash: Hash;
       try {
+        // 3-arg call: adapter, data (ABI-encoded MarketParams), assets.
+        // No bytes4 selector — Vault V2 does not have that argument.
         txHash = await this.walletClient.writeContract({
           address: vaultAddress,
           abi: VAULT_V2_ABI,
           functionName,
-          args: [action.adapter, action.data, action.amount, ZERO_SELECTOR],
+          args: [action.adapter, action.data, action.amount],
         });
       } catch (err) {
         // Transaction submission failed (e.g. simulation revert, nonce error).
@@ -179,6 +179,7 @@ export class DryRunExecutor implements IExecutor {
 
 /**
  * Log proposed actions to stdout in a human-readable format.
+ * References action.marketLabel (human-readable market name) for legibility.
  * This is the only place we emit output in dry-run mode — not a debug
  * statement left in production code, but an intentional informational log.
  */
@@ -193,7 +194,7 @@ function logDryRunActions(actions: RebalanceAction[]): void {
   for (const [i, action] of actions.entries()) {
     // eslint-disable-next-line no-console
     console.info(
-      `  [${i + 1}] ${action.direction.toUpperCase()} adapter=${action.adapter} amount=${action.amount.toString()}`
+      `  [${i + 1}] ${action.direction.toUpperCase()} market="${action.marketLabel}" amount=${action.amount.toString()}`
     );
   }
 }

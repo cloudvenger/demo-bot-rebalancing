@@ -15,7 +15,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Address, Hash } from "viem";
 import { MorphoReader } from "../../src/core/chain/morpho.js";
 import type { BotPublicClient } from "../../src/core/chain/client.js";
-import type { AdapterState } from "../../src/core/rebalancer/types.js";
+import type { ManagedMarket } from "../../src/core/rebalancer/types.js";
 import { WAD } from "../../src/config/constants.js";
 
 // ---------------------------------------------------------------------------
@@ -403,137 +403,75 @@ describe("MorphoReader.readIRMParams", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. readMarketsForAdapters — filtering and batch reading
+// 4. readMarketsForManagedMarkets — V2 single-adapter model
 // ---------------------------------------------------------------------------
 
-describe("MorphoReader.readMarketsForAdapters", () => {
-  const MARKET_ADAPTER_A: Address = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-  const MARKET_ADAPTER_B: Address = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
-  const VAULT_ADAPTER: Address = "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
-
+describe("MorphoReader.readMarketsForManagedMarkets", () => {
   const MARKET_ID_A: Hash =
     "0xaaaa000000000000000000000000000000000000000000000000000000000000";
   const MARKET_ID_B: Hash =
     "0xbbbb000000000000000000000000000000000000000000000000000000000000";
 
-  function makeMarketAdapterState(address: Address): AdapterState {
+  const ADAPTER_ADDR: Address = "0x2222222222222222222222222222222222222222";
+  const CAP_ID: Hash = "0xd000000000000000000000000000000000000000000000000000000000000000";
+
+  function makeManagedMarket(label: string, marketId: Hash): ManagedMarket {
     return {
-      address,
-      adapterType: "morpho-market-v1",
-      realAssets: 1_000_000n,
-      allocationPercentage: 0.1,
-      absoluteCap: 5_000_000n,
-      relativeCap: 5_000,
+      label,
+      marketId,
+      marketParams: {
+        loanToken: LOAN_TOKEN,
+        collateralToken: COLLATERAL_TOKEN,
+        oracle: ORACLE,
+        irm: IRM_ADDRESS,
+        lltv: LLTV,
+      },
+      capIds: [CAP_ID, CAP_ID, CAP_ID],
     };
   }
 
-  function makeVaultAdapterState(address: Address): AdapterState {
-    return {
-      address,
-      adapterType: "morpho-vault-v1",
-      realAssets: 1_000_000n,
-      allocationPercentage: 0.1,
-      absoluteCap: 5_000_000n,
-      relativeCap: 5_000,
-    };
-  }
-
-  it("returns an empty array when there are no adapters at all", async () => {
+  it("returns an empty array when there are no managed markets", async () => {
     const client = makeMockClient({ readContract: vi.fn(), multicall: vi.fn() });
     const reader = new MorphoReader(client, MORPHO_ADDRESS);
 
-    const result = await reader.readMarketsForAdapters([]);
+    const result = await reader.readMarketsForManagedMarkets([]);
 
     expect(result).toEqual([]);
   });
 
-  it("returns an empty array when all adapters are vault-type (morpho-vault-v1)", async () => {
-    const adapters = [makeVaultAdapterState(VAULT_ADAPTER)];
-    const multicall = vi.fn();
-    const client = makeMockClient({ readContract: vi.fn(), multicall });
-    const reader = new MorphoReader(client, MORPHO_ADDRESS);
+  it("returns MarketData with the correct marketId for a single managed market", async () => {
+    const markets = [makeManagedMarket("USDC/WETH 86%", MARKET_ID_A)];
 
-    const result = await reader.readMarketsForAdapters(adapters);
-
-    expect(result).toEqual([]);
-    // multicall should not have been called at all (no market adapters)
-    expect(multicall).not.toHaveBeenCalled();
-  });
-
-  it("only reads market data for morpho-market-v1 adapters, skipping vault adapters", async () => {
-    const adapters = [
-      makeMarketAdapterState(MARKET_ADAPTER_A),
-      makeVaultAdapterState(VAULT_ADAPTER),
-    ];
-
-    // Multicall 1: marketId() for MARKET_ADAPTER_A only
-    const multicall = vi
-      .fn()
-      .mockResolvedValueOnce([{ status: "success", result: MARKET_ID_A }])
-      // readMarketData batch 1 (market + params)
-      .mockResolvedValueOnce([
-        [
-          TOTAL_SUPPLY_ASSETS,
-          TOTAL_SUPPLY_SHARES,
-          TOTAL_BORROW_ASSETS,
-          TOTAL_BORROW_SHARES,
-          LAST_UPDATE,
-          FEE,
-        ],
-        [LOAN_TOKEN, COLLATERAL_TOKEN, ORACLE, IRM_ADDRESS, LLTV],
-      ]);
-
+    const multicall = vi.fn().mockResolvedValueOnce([
+      [
+        TOTAL_SUPPLY_ASSETS,
+        TOTAL_SUPPLY_SHARES,
+        TOTAL_BORROW_ASSETS,
+        TOTAL_BORROW_SHARES,
+        LAST_UPDATE,
+        FEE,
+      ],
+      [LOAN_TOKEN, COLLATERAL_TOKEN, ORACLE, IRM_ADDRESS, LLTV],
+    ]);
     const readContract = vi.fn().mockResolvedValueOnce(BORROW_RATE_PER_SECOND);
     const client = makeMockClient({ readContract, multicall });
     const reader = new MorphoReader(client, MORPHO_ADDRESS);
 
-    const result = await reader.readMarketsForAdapters(adapters);
+    const result = await reader.readMarketsForManagedMarkets(markets);
 
-    // Only one market data entry — for the market-v1 adapter
     expect(result).toHaveLength(1);
-  });
-
-  it("returns MarketData with the correct marketId for a single market adapter", async () => {
-    const adapters = [makeMarketAdapterState(MARKET_ADAPTER_A)];
-
-    const multicall = vi
-      .fn()
-      .mockResolvedValueOnce([{ status: "success", result: MARKET_ID_A }])
-      .mockResolvedValueOnce([
-        [
-          TOTAL_SUPPLY_ASSETS,
-          TOTAL_SUPPLY_SHARES,
-          TOTAL_BORROW_ASSETS,
-          TOTAL_BORROW_SHARES,
-          LAST_UPDATE,
-          FEE,
-        ],
-        [LOAN_TOKEN, COLLATERAL_TOKEN, ORACLE, IRM_ADDRESS, LLTV],
-      ]);
-
-    const readContract = vi.fn().mockResolvedValueOnce(BORROW_RATE_PER_SECOND);
-    const client = makeMockClient({ readContract, multicall });
-    const reader = new MorphoReader(client, MORPHO_ADDRESS);
-
-    const result = await reader.readMarketsForAdapters(adapters);
-
     expect(result[0].marketId).toBe(MARKET_ID_A);
   });
 
-  it("reads market data for two market-type adapters and returns two entries", async () => {
-    const adapters = [
-      makeMarketAdapterState(MARKET_ADAPTER_A),
-      makeMarketAdapterState(MARKET_ADAPTER_B),
+  it("returns MarketData for two managed markets in positional order", async () => {
+    const markets = [
+      makeManagedMarket("USDC/WETH 86%", MARKET_ID_A),
+      makeManagedMarket("USDC/wstETH 86%", MARKET_ID_B),
     ];
 
     const multicall = vi
       .fn()
-      // Step 1: marketId() for both adapters
-      .mockResolvedValueOnce([
-        { status: "success", result: MARKET_ID_A },
-        { status: "success", result: MARKET_ID_B },
-      ])
-      // readMarketData for adapter A (batch 1)
+      // readMarketData for market A
       .mockResolvedValueOnce([
         [
           TOTAL_SUPPLY_ASSETS,
@@ -545,7 +483,7 @@ describe("MorphoReader.readMarketsForAdapters", () => {
         ],
         [LOAN_TOKEN, COLLATERAL_TOKEN, ORACLE, IRM_ADDRESS, LLTV],
       ])
-      // readMarketData for adapter B (batch 1)
+      // readMarketData for market B
       .mockResolvedValueOnce([
         [
           TOTAL_SUPPLY_ASSETS,
@@ -566,25 +504,22 @@ describe("MorphoReader.readMarketsForAdapters", () => {
     const client = makeMockClient({ readContract, multicall });
     const reader = new MorphoReader(client, MORPHO_ADDRESS);
 
-    const result = await reader.readMarketsForAdapters(adapters);
+    const result = await reader.readMarketsForManagedMarkets(markets);
 
     expect(result).toHaveLength(2);
+    expect(result[0].marketId).toBe(MARKET_ID_A);
+    expect(result[1].marketId).toBe(MARKET_ID_B);
   });
 
-  it("skips an adapter whose marketId() call returns a failure status", async () => {
-    const adapters = [
-      makeMarketAdapterState(MARKET_ADAPTER_A),
-      makeMarketAdapterState(MARKET_ADAPTER_B),
+  it("skips a market when readMarketData throws for it (graceful failure)", async () => {
+    const markets = [
+      makeManagedMarket("USDC/WETH 86%", MARKET_ID_A),
+      makeManagedMarket("USDC/wstETH 86%", MARKET_ID_B),
     ];
 
+    // readMarketData for market A succeeds; market B fails after retries
     const multicall = vi
       .fn()
-      // Adapter A: success; Adapter B: failure (no marketId exposed)
-      .mockResolvedValueOnce([
-        { status: "success", result: MARKET_ID_A },
-        { status: "failure", error: new Error("revert") },
-      ])
-      // readMarketData for adapter A only
       .mockResolvedValueOnce([
         [
           TOTAL_SUPPLY_ASSETS,
@@ -595,58 +530,32 @@ describe("MorphoReader.readMarketsForAdapters", () => {
           FEE,
         ],
         [LOAN_TOKEN, COLLATERAL_TOKEN, ORACLE, IRM_ADDRESS, LLTV],
-      ]);
+      ])
+      .mockRejectedValue(new Error("persistent RPC error"));
 
+    vi.useFakeTimers();
     const readContract = vi.fn().mockResolvedValueOnce(BORROW_RATE_PER_SECOND);
     const client = makeMockClient({ readContract, multicall });
     const reader = new MorphoReader(client, MORPHO_ADDRESS);
 
-    const result = await reader.readMarketsForAdapters(adapters);
-
-    // Only adapter A's market data is returned; B was skipped
-    expect(result).toHaveLength(1);
-    expect(result[0].marketId).toBe(MARKET_ID_A);
-  });
-
-  it("skips an adapter when readMarketData throws for it (graceful failure)", async () => {
-    const adapters = [
-      makeMarketAdapterState(MARKET_ADAPTER_A),
-      makeMarketAdapterState(MARKET_ADAPTER_B),
-    ];
-
-    const multicall = vi
-      .fn()
-      .mockResolvedValueOnce([
-        { status: "success", result: MARKET_ID_A },
-        { status: "success", result: MARKET_ID_B },
-      ])
-      // readMarketData for A: permanently fails (3 retries)
-      .mockRejectedValue(new Error("persistent RPC error"));
-
-    vi.useFakeTimers();
-    const readContract = vi.fn();
-    const client = makeMockClient({ readContract, multicall });
-    const reader = new MorphoReader(client, MORPHO_ADDRESS);
-
-    const promise = reader.readMarketsForAdapters(adapters);
+    const promise = reader.readMarketsForManagedMarkets(markets);
     await vi.runAllTimersAsync();
     const result = await promise;
 
-    // Both markets failed gracefully — result is empty, no throw
+    // Graceful failure — market B is skipped, A is returned
     expect(Array.isArray(result)).toBe(true);
 
     vi.useRealTimers();
   });
 
   it("uses the default Morpho Blue address when no address is passed to constructor", async () => {
-    // Create reader without an explicit morpho address
     const readContract = vi.fn();
-    const multicall = vi.fn().mockResolvedValueOnce([]);
+    const multicall = vi.fn();
     const client = makeMockClient({ readContract, multicall });
 
-    // Should not throw — just uses the hardcoded MORPHO_BLUE_ADDRESS
+    // Should not throw — uses the hardcoded MORPHO_BLUE_ADDRESS
     const reader = new MorphoReader(client);
-    const result = await reader.readMarketsForAdapters([]);
+    const result = await reader.readMarketsForManagedMarkets([]);
 
     expect(result).toEqual([]);
   });

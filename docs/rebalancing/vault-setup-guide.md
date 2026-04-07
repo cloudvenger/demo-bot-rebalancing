@@ -1,6 +1,38 @@
-# Vault V2 Setup Guide — USDC with 3 Morpho Blue Markets
+# Vault V2 Setup Guide — USDC with N Morpho Blue Markets
 
-> Step-by-step guide to creating a Morpho Vault V2 for USDC and connecting it to 3 Morpho Blue lending markets on Ethereum mainnet.
+> Step-by-step guide to deploying a Morpho Vault V2 for USDC and configuring it to lend across multiple Morpho Blue markets on Ethereum mainnet, ready for the rebalancing bot to manage.
+
+> **⚠ Rewritten 2026-04-07.** The original version of this guide assumed N market adapters per vault. Morpho Vault V2 actually exposes **one adapter per protocol** that routes to many Morpho Blue markets via `MarketParams` in the call data. Every command and signature in this guide has been verified against [`morpho-org/vault-v2`](https://github.com/morpho-org/vault-v2) source.
+
+---
+
+## Mental model — single adapter, N markets
+
+In Morpho Vault V2, an **adapter** is a per-protocol routing module, not a per-market handle. The single `MorphoMarketV1AdapterV2` instance you deploy here handles **every** Morpho Blue USDC market that uses the AdaptiveCurveIRM. The bot picks which market to allocate to at runtime by encoding the target `MarketParams` into the `bytes` argument of `vault.allocate(adapter, abi.encode(marketParams), assets)`.
+
+This means there are two layers of configuration:
+
+| Layer | Where | Stored where |
+|---|---|---|
+| **Which markets are authorized** | Curator sets caps on the vault for each market's 3 cap ids | On-chain (vault storage) |
+| **Which markets the bot considers** | `MANAGED_MARKETS_PATH` JSON file | Off-chain (bot config) |
+
+The bot at startup walks the JSON list and asserts the on-chain caps are set for every entry. Markets without caps are ignored. Markets with `relativeCap == 0` cause the bot to refuse to start with an explicit error (per [SPEC Story A2](../../SPEC.md)).
+
+## Role model
+
+V2 uses a custom role system, **not** OpenZeppelin AccessControl. The roles, in order of trust:
+
+| Role | Powers | How granted |
+|---|---|---|
+| **Owner** | Sets curator + sentinels; sets vault name/symbol | Constructor (the address passed to `createVaultV2`) |
+| **Curator** | Configures adapters, caps, allocators, fees, gates, timelocks | `vault.setCurator(addr)` — owner-only, NOT timelocked |
+| **Allocator** | Calls `allocate` / `deallocate` / `setLiquidityAdapterAndData` | `vault.setIsAllocator(addr, true)` — curator, timelocked |
+| **Sentinel** | Emergency derisk: revoke pending actions, decrease caps | `vault.setIsSentinel(addr, true)` — owner |
+
+For the demo deployment in this repo, **the deployer is owner AND curator**. This is the simplest setup — one EOA does the entire configuration in a single Forge script run. The bot wallet receives only the allocator role (least privilege). For production, you should split owner / curator into a multisig and a separate operator EOA.
+
+> **Curator timelocks default to 0 at fresh deploy.** This is verified in the V2 source. It lets the deployment script batch every curator action (`addAdapter`, every cap change, `setIsAllocator`) into a single `vault.multicall(...)` transaction. After deployment you can call `increaseTimelock(selector, duration)` to enforce a delay on subsequent changes.
 
 ---
 
@@ -8,299 +40,237 @@
 
 | Requirement | Details |
 |---|---|
-| **ETH** | Sufficient ETH in your deployer wallet for gas (~0.1 ETH recommended) |
-| **USDC** | USDC to seed the vault after setup (optional for the deployment itself) |
-| **Foundry** | Install via `curl -L https://foundry.paradigm.xyz | bash && foundryup` |
-| **RPC URL** | An Ethereum mainnet RPC endpoint (Alchemy, Infura, or your own node) |
-| **Private key** | The deployer wallet's private key (this wallet becomes the vault owner) |
+| **ETH** | ~0.05 ETH in your deployer wallet for gas (mainnet). 0 ETH for fork testing. |
+| **Foundry** | `curl -L https://foundry.paradigm.xyz \| bash && foundryup` |
+| **forge-std** | Tracked as a submodule in this repo. Run `git submodule update --init --recursive` after cloning. |
+| **RPC URL** | Ethereum mainnet RPC (Alchemy, Infura, or your own node) |
+| **Two wallets** | (1) Deployer / owner / curator EOA; (2) Bot wallet that will receive the allocator role |
+| **Bot config decided** | Which Morpho Blue USDC markets the bot will manage (e.g. USDC/WETH, USDC/wstETH, USDC/WBTC) |
 
----
-
-## Overview
-
-We are deploying:
-
-1. **Vault V2** — A Morpho Vault V2 that holds USDC and allocates it across Morpho Blue markets
-2. **3 MorphoMarketV1AdapterV2 adapters** — One per target market, bridging the vault to each Morpho Blue lending market:
-   - USDC/WETH (high liquidity)
-   - USDC/wstETH (LST demand)
-   - USDC/WBTC (BTC collateral)
-
-After deployment, we configure caps on each adapter and grant the **Allocator** role to the bot's wallet so it can rebalance automatically.
-
-### Key Contract Addresses (Ethereum Mainnet)
+### Key contract addresses (Ethereum mainnet)
 
 | Contract | Address |
 |---|---|
 | VaultV2Factory | `0xA1D94F746dEfa1928926b84fB2596c06926C0405` |
 | MorphoMarketV1AdapterV2Factory | `0x32BB1c0D48D8b1B3363e86eeB9A0300BAd61ccc1` |
-| USDC | `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` |
-| WETH | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` |
-| wstETH | `0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0` |
-| WBTC | `0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599` |
+| AdaptiveCurveIRM | `0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC` |
 | Morpho Blue | `0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb` |
-| Adaptive Curve IRM | `0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC` |
-
-> **Note:** The Adaptive Curve IRM address is the most commonly used IRM on Morpho Blue. Verify the IRM address for your target markets on [app.morpho.org](https://app.morpho.org) or via on-chain reads before deploying.
+| USDC | `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` |
+| WETH (collateral) | `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2` |
+| wstETH (collateral) | `0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0` |
+| WBTC (collateral) | `0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599` |
 
 ---
 
-## Step 1: Deploy a Vault V2
+## Recommended path: use the Foundry script
 
-Call `createVault()` on the VaultV2Factory to deploy a new vault with USDC as the underlying asset.
+The repo includes [`script/DeployVault.s.sol`](../../script/DeployVault.s.sol) which automates **every** step in this guide in one transaction. **You should use the script unless you have a specific reason to do it manually.** See [`script/README.md`](../../script/README.md) for the full script docs (env vars, JSON shape, troubleshooting).
+
+Quick start:
 
 ```bash
-# Using cast (Foundry CLI)
+# 1. Install forge-std submodule (one-time)
+git submodule update --init --recursive
+
+# 2. Compile
+forge build
+
+# 3. Configure .env
+cat > .env <<EOF
+OWNER=0xYourDeployerAddress
+BOT_WALLET=0xYourBotWalletAddress
+PRIVATE_KEY=0xYourDeployerPrivateKey
+RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
+MANAGED_MARKETS_PATH=./managed-markets.json
+EOF
+
+# 4. Create managed-markets.json (see script/README.md for the shape)
+
+# 5. Dry-run on a forked mainnet first
+source .env
+forge script script/DeployVault.s.sol \
+  --fork-url $RPC_URL \
+  --broadcast \
+  -vvvv
+
+# 6. After verifying the fork run, repeat against mainnet (no --fork-url)
+forge script script/DeployVault.s.sol \
+  --rpc-url $RPC_URL \
+  --broadcast \
+  --verify \
+  -vvvv
+```
+
+The script prints a **DEPLOYMENT SUMMARY** at the end with the vault address, adapter address, every cap id (in hex with absolute and relative caps formatted), and a ready-to-paste `MANAGED_MARKETS JSON` block plus the `.env` lines for `VAULT_ADDRESS` and `ADAPTER_ADDRESS` you'll add to the bot's config.
+
+---
+
+## Doing it manually with `cast` (advanced)
+
+If you need to deploy without the script — for instance if you want to use a hardware wallet via a custom signer — here is the equivalent step-by-step using `cast`. Each step matches one of the script's stages.
+
+### Step 1: Deploy the vault
+
+```bash
 cast send 0xA1D94F746dEfa1928926b84fB2596c06926C0405 \
-  "createVault(address,address,string,string)" \
+  "createVaultV2(address,address,bytes32)(address)" \
+  $OWNER \
   0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 \
-  <YOUR_OWNER_ADDRESS> \
-  "USDC Yield Vault" \
-  "yvUSDC" \
+  0x0000000000000000000000000000000000000000000000000000000000000000 \
   --rpc-url $RPC_URL \
   --private-key $PRIVATE_KEY
 ```
 
 Parameters:
-- `asset`: `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` (USDC)
-- `owner`: Your deployer/owner wallet address
-- `name`: Human-readable vault name (e.g., "USDC Yield Vault")
-- `symbol`: Vault share token symbol (e.g., "yvUSDC")
+- `owner`: your deployer EOA (will also become the curator in step 4)
+- `asset`: USDC
+- `salt`: `bytes32(0)` for a non-deterministic deploy. Use a different salt to get a deterministic CREATE2 address.
 
-> **Note:** The exact function signature may vary. Check the VaultV2Factory ABI on Etherscan at the factory address to confirm the `createVault` parameters. The factory may also accept additional parameters such as a `timelock` duration or `guardian` address.
+> The factory does **not** take name/symbol parameters. Vault name and symbol are set later via owner-only `setName` / `setSymbol` calls if needed.
 
-**Save the returned vault address** — you will need it for all subsequent steps.
+**Save the returned vault address** as `$VAULT`.
 
-### Verify the vault was deployed
-
-```bash
-# Read the vault's asset (should return USDC address)
-cast call <VAULT_ADDRESS> "asset()" --rpc-url $RPC_URL
-
-# Read total assets (should be 0 initially)
-cast call <VAULT_ADDRESS> "totalAssets()" --rpc-url $RPC_URL
-```
-
----
-
-## Step 2: Deploy 3 MorphoMarketV1AdapterV2 Adapters
-
-Each adapter connects the vault to a specific Morpho Blue lending market. A Morpho Blue market is identified by a `MarketParams` struct:
-
-```solidity
-struct MarketParams {
-    address loanToken;
-    address collateralToken;
-    address oracle;
-    address irm;
-    uint256 lltv;
-}
-```
-
-> **Important:** You must use the exact `oracle`, `irm`, and `lltv` values for each market as they exist on-chain. The values below are representative — verify them on [app.morpho.org](https://app.morpho.org) or by querying `idToMarketParams(marketId)` on the Morpho Blue contract (`0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb`).
-
-### Market 1: USDC/WETH
+### Step 2: Deploy the single adapter
 
 ```bash
 cast send 0x32BB1c0D48D8b1B3363e86eeB9A0300BAd61ccc1 \
-  "createAdapter(address,(address,address,address,address,uint256))" \
-  <VAULT_ADDRESS> \
-  "(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,<ORACLE_ADDRESS>,0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC,<LLTV>)" \
+  "createMorphoMarketV1AdapterV2(address)(address)" \
+  $VAULT \
   --rpc-url $RPC_URL \
   --private-key $PRIVATE_KEY
 ```
 
-### Market 2: USDC/wstETH
+The adapter is deployed with the vault as its parent. It wires Morpho Blue (`0xBBBB...EFFCb`) and AdaptiveCurveIRM (`0x870a...00BC`) as immutables from the factory. **No `MarketParams` at deploy time** — the adapter routes to any market that satisfies `loanToken == USDC` and `irm == AdaptiveCurveIRM`.
+
+**Save the returned adapter address** as `$ADAPTER`.
+
+### Step 3: Set yourself as the curator
 
 ```bash
-cast send 0x32BB1c0D48D8b1B3363e86eeB9A0300BAd61ccc1 \
-  "createAdapter(address,(address,address,address,address,uint256))" \
-  <VAULT_ADDRESS> \
-  "(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0,<ORACLE_ADDRESS>,0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC,<LLTV>)" \
+cast send $VAULT \
+  "setCurator(address)" \
+  $OWNER \
   --rpc-url $RPC_URL \
   --private-key $PRIVATE_KEY
 ```
 
-### Market 3: USDC/WBTC
+This is owner-only and **not** timelocked. After this call you (the owner) are also the curator and can configure the vault.
+
+### Step 4: Compute the cap ids for each market
+
+For each Morpho Blue market you want the bot to manage, compute the 3 cap ids the adapter exposes. Pseudocode (use a small Solidity helper or the Forge script's `_buildIdDatas` function):
+
+```
+adapterIdData         = abi.encode("this", $ADAPTER)
+collateralIdData[mkt] = abi.encode("collateralToken", marketParams.collateralToken)
+marketIdData[mkt]     = abi.encode("this/marketParams", $ADAPTER, marketParams)
+
+adapterId         = keccak256(adapterIdData)
+collateralId[mkt] = keccak256(collateralIdData[mkt])
+marketId[mkt]     = keccak256(marketIdData[mkt])
+```
+
+These exact preimages are verified against [`MorphoMarketV1AdapterV2.sol`](https://github.com/morpho-org/vault-v2/blob/main/src/adapters/MorphoMarketV1AdapterV2.sol#L267) and documented in [PLAN.md § Verified cap-id preimages](../../PLAN.md#verified-cap-id-preimages). **Any deviation in the preimage produces a different `keccak256`, and `vault.allocate(...)` will revert with `ZeroAbsoluteCap` at runtime.** The Forge script removes all chance of preimage drift; the manual path is error-prone.
+
+You can verify your local computation against the on-chain truth by calling:
 
 ```bash
-cast send 0x32BB1c0D48D8b1B3363e86eeB9A0300BAd61ccc1 \
-  "createAdapter(address,(address,address,address,address,uint256))" \
-  <VAULT_ADDRESS> \
-  "(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,<ORACLE_ADDRESS>,0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC,<LLTV>)" \
-  --rpc-url $RPC_URL \
-  --private-key $PRIVATE_KEY
+cast call $ADAPTER \
+  "ids((address,address,address,address,uint256))(bytes32[])" \
+  "($USDC,$COLLATERAL,$ORACLE,$IRM,$LLTV)" \
+  --rpc-url $RPC_URL
 ```
 
-> **How to find oracle and LLTV for each market:** Browse existing USDC markets on [app.morpho.org](https://app.morpho.org) or query the Morpho Blue contract:
-> ```bash
-> # Get MarketParams for a known market ID
-> cast call 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb \
->   "idToMarketParams(bytes32)" <MARKET_ID> --rpc-url $RPC_URL
-> ```
+This returns the 3 cap ids as the adapter computes them. They MUST match your locally derived values.
 
-> **Note:** The exact `createAdapter` function signature may differ. Check the MorphoMarketV1AdapterV2Factory ABI on Etherscan. The factory may require additional parameters or use a different function name (e.g., `create`, `deploy`).
+### Step 5: Set caps for each cap id
 
-**Save all 3 adapter addresses.**
+Curator config is timelocked, but the timelock defaults to 0, so you `submit` and execute in two consecutive transactions (or batch them via `vault.multicall(...)`).
+
+For each market and each of its 3 cap ids, set both absolute and relative caps:
+
+```bash
+# 1. Submit increaseAbsoluteCap
+cast send $VAULT \
+  "submit(bytes)" \
+  $(cast calldata "increaseAbsoluteCap(bytes,uint256)" $ID_DATA 500000000000) \
+  --rpc-url $RPC_URL --private-key $PRIVATE_KEY
+
+# 2. Execute it (timelock=0, immediately)
+cast send $VAULT \
+  "increaseAbsoluteCap(bytes,uint256)" \
+  $ID_DATA 500000000000 \
+  --rpc-url $RPC_URL --private-key $PRIVATE_KEY
+
+# 3. Submit increaseRelativeCap
+cast send $VAULT \
+  "submit(bytes)" \
+  $(cast calldata "increaseRelativeCap(bytes,uint256)" $ID_DATA 1000000000000000000) \
+  --rpc-url $RPC_URL --private-key $PRIVATE_KEY
+
+# 4. Execute it
+cast send $VAULT \
+  "increaseRelativeCap(bytes,uint256)" \
+  $ID_DATA 1000000000000000000 \
+  --rpc-url $RPC_URL --private-key $PRIVATE_KEY
+```
+
+Repeat for each of the 3 ids per market. For 3 markets × 3 ids × 2 caps × 2 transactions (submit + execute) = **36 transactions**. The Forge script does this in a single multicall.
+
+#### Important: cap units
+
+| Cap | Unit | Notes |
+|---|---|---|
+| `absoluteCap` | uint256 in USDC native decimals (6) | `500000000000` = 500,000 USDC. Must be > 0 on every id for `allocate` to succeed. |
+| `relativeCap` | **uint256 in WAD** (1e18 = 100%) | `1000000000000000000` (= WAD) means "no relative cap". `500000000000000000` (= 5e17) means 50%. **Never 0** — that forbids the market and the bot will refuse to start. |
+
+### Step 6: Grant the allocator role to the bot wallet
+
+Same submit-then-execute pattern (timelocked but timelock=0):
+
+```bash
+cast send $VAULT \
+  "submit(bytes)" \
+  $(cast calldata "setIsAllocator(address,bool)" $BOT_WALLET true) \
+  --rpc-url $RPC_URL --private-key $PRIVATE_KEY
+
+cast send $VAULT \
+  "setIsAllocator(address,bool)" \
+  $BOT_WALLET true \
+  --rpc-url $RPC_URL --private-key $PRIVATE_KEY
+```
+
+### Step 7: Verify the full setup
+
+```bash
+# Vault basics
+cast call $VAULT "asset()(address)" --rpc-url $RPC_URL                  # → USDC
+cast call $VAULT "totalAssets()(uint256)" --rpc-url $RPC_URL            # → 0 before any deposit
+
+# Adapter is enabled
+cast call $VAULT "adaptersLength()(uint256)" --rpc-url $RPC_URL         # → 1
+cast call $VAULT "adaptersAt(uint256)(address)" 0 --rpc-url $RPC_URL    # → $ADAPTER
+
+# Bot wallet has allocator role
+cast call $VAULT "isAllocator(address)(bool)" $BOT_WALLET --rpc-url $RPC_URL  # → true
+
+# Caps for each id (per market)
+cast call $VAULT "absoluteCap(bytes32)(uint256)" $ID --rpc-url $RPC_URL
+cast call $VAULT "relativeCap(bytes32)(uint256)" $ID --rpc-url $RPC_URL  # → 1000000000000000000 (WAD) by default
+
+# Adapter parent
+cast call $ADAPTER "parentVault()(address)" --rpc-url $RPC_URL          # → $VAULT
+```
+
+> **Note:** There is no `realAssets()` per market in V2 — the bot reads `vault.allocation(id)` for the market-specific cap id (`id[2]`) instead. See [PLAN.md § MorphoMarketV1AdapterV2](../../PLAN.md#morphomarketv1adapterv2-single-adapter-per-vault).
 
 ---
 
-## Step 3: Enable Adapters on the Vault
+## Testing on a fork first
 
-Each adapter must be enabled on the vault before it can receive allocations.
+**Always test on a forked mainnet before deploying to production.** Two options:
 
-```bash
-# Enable adapter 1 (USDC/WETH)
-cast send <VAULT_ADDRESS> \
-  "enableAdapter(address)" \
-  <ADAPTER_1_ADDRESS> \
-  --rpc-url $RPC_URL \
-  --private-key $PRIVATE_KEY
-
-# Enable adapter 2 (USDC/wstETH)
-cast send <VAULT_ADDRESS> \
-  "enableAdapter(address)" \
-  <ADAPTER_2_ADDRESS> \
-  --rpc-url $RPC_URL \
-  --private-key $PRIVATE_KEY
-
-# Enable adapter 3 (USDC/WBTC)
-cast send <VAULT_ADDRESS> \
-  "enableAdapter(address)" \
-  <ADAPTER_3_ADDRESS> \
-  --rpc-url $RPC_URL \
-  --private-key $PRIVATE_KEY
-```
-
-> **Note:** The function to enable an adapter may be named differently (e.g., `addAdapter`, `setAdapter`, or require going through a configuration function). Verify the vault's ABI.
-
-### Verify adapters are enabled
-
-```bash
-# Check number of adapters
-cast call <VAULT_ADDRESS> "adaptersLength()" --rpc-url $RPC_URL
-
-# Read adapter at index 0, 1, 2
-cast call <VAULT_ADDRESS> "adaptersAt(uint256)" 0 --rpc-url $RPC_URL
-cast call <VAULT_ADDRESS> "adaptersAt(uint256)" 1 --rpc-url $RPC_URL
-cast call <VAULT_ADDRESS> "adaptersAt(uint256)" 2 --rpc-url $RPC_URL
-```
-
----
-
-## Step 4: Set Caps on Each Adapter
-
-Caps limit how much the vault can allocate to any single adapter. There are two types:
-
-- **Absolute cap** — Maximum USDC amount (in raw units, 6 decimals for USDC). Example: 500,000 USDC = `500000000000`
-- **Relative cap** — Maximum percentage of total vault assets (in basis points). Example: 50% = `5000`
-
-Each adapter has a **risk ID** (a `bytes32` identifier) used by the vault's cap system. The risk ID is typically derived from the adapter's market parameters.
-
-```bash
-# Set caps for adapter 1 (USDC/WETH)
-# Absolute cap: 500,000 USDC, Relative cap: 50% (5000 bps)
-cast send <VAULT_ADDRESS> \
-  "setCap(bytes32,uint256,uint256)" \
-  <RISK_ID_1> \
-  500000000000 \
-  5000 \
-  --rpc-url $RPC_URL \
-  --private-key $PRIVATE_KEY
-
-# Set caps for adapter 2 (USDC/wstETH)
-# Absolute cap: 300,000 USDC, Relative cap: 40% (4000 bps)
-cast send <VAULT_ADDRESS> \
-  "setCap(bytes32,uint256,uint256)" \
-  <RISK_ID_2> \
-  300000000000 \
-  4000 \
-  --rpc-url $RPC_URL \
-  --private-key $PRIVATE_KEY
-
-# Set caps for adapter 3 (USDC/WBTC)
-# Absolute cap: 200,000 USDC, Relative cap: 30% (3000 bps)
-cast send <VAULT_ADDRESS> \
-  "setCap(bytes32,uint256,uint256)" \
-  <RISK_ID_3> \
-  200000000000 \
-  3000 \
-  --rpc-url $RPC_URL \
-  --private-key $PRIVATE_KEY
-```
-
-> **Note:** The `setCap` function signature and how risk IDs are computed may differ in the actual Vault V2 contract. The risk ID might be derived from `keccak256(abi.encode(adapterAddress))` or from the market parameters. Check the vault contract source for the exact mechanism. The vault may also have a timelock on cap changes.
-
-### Verify caps
-
-```bash
-cast call <VAULT_ADDRESS> "caps(bytes32)" <RISK_ID_1> --rpc-url $RPC_URL
-cast call <VAULT_ADDRESS> "caps(bytes32)" <RISK_ID_2> --rpc-url $RPC_URL
-cast call <VAULT_ADDRESS> "caps(bytes32)" <RISK_ID_3> --rpc-url $RPC_URL
-```
-
----
-
-## Step 5: Grant the Allocator Role
-
-The bot's wallet needs the **Allocator** role to call `allocate()` and `deallocate()` on the vault. Only the vault owner can grant this role.
-
-```bash
-cast send <VAULT_ADDRESS> \
-  "grantRole(address)" \
-  <BOT_WALLET_ADDRESS> \
-  --rpc-url $RPC_URL \
-  --private-key $PRIVATE_KEY
-```
-
-> **Note:** The role-granting mechanism may use OpenZeppelin's AccessControl pattern (e.g., `grantRole(bytes32 role, address account)` with a specific role hash like `ALLOCATOR_ROLE`), or it may use a custom function like `setAllocator(address, bool)`. Verify the vault contract's role management interface.
-
----
-
-## Step 6: Verify the Full Setup
-
-Run these read calls to confirm everything is configured correctly:
-
-```bash
-echo "=== Vault Info ==="
-cast call <VAULT_ADDRESS> "asset()" --rpc-url $RPC_URL
-cast call <VAULT_ADDRESS> "totalAssets()" --rpc-url $RPC_URL
-
-echo "=== Adapters ==="
-cast call <VAULT_ADDRESS> "adaptersLength()" --rpc-url $RPC_URL
-cast call <VAULT_ADDRESS> "adaptersAt(uint256)" 0 --rpc-url $RPC_URL
-cast call <VAULT_ADDRESS> "adaptersAt(uint256)" 1 --rpc-url $RPC_URL
-cast call <VAULT_ADDRESS> "adaptersAt(uint256)" 2 --rpc-url $RPC_URL
-
-echo "=== Caps ==="
-cast call <VAULT_ADDRESS> "caps(bytes32)" <RISK_ID_1> --rpc-url $RPC_URL
-cast call <VAULT_ADDRESS> "caps(bytes32)" <RISK_ID_2> --rpc-url $RPC_URL
-cast call <VAULT_ADDRESS> "caps(bytes32)" <RISK_ID_3> --rpc-url $RPC_URL
-
-echo "=== Adapter Assets (should all be 0 before first deposit) ==="
-cast call <ADAPTER_1_ADDRESS> "realAssets()" --rpc-url $RPC_URL
-cast call <ADAPTER_2_ADDRESS> "realAssets()" --rpc-url $RPC_URL
-cast call <ADAPTER_3_ADDRESS> "realAssets()" --rpc-url $RPC_URL
-```
-
----
-
-## Testing on a Fork First
-
-**Always test on a forked mainnet before deploying to production.** This lets you verify the entire setup without spending real ETH or risking real USDC.
-
-```bash
-# Start a local Anvil fork
-anvil --fork-url $RPC_URL --chain-id 1
-
-# In another terminal, run your deployment commands against the fork
-export RPC_URL=http://127.0.0.1:8545
-
-# Use one of Anvil's default funded accounts
-export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
-```
-
-Alternatively, use the Foundry deployment script provided in this repo:
+### Option A — Direct fork via the script
 
 ```bash
 forge script script/DeployVault.s.sol \
@@ -309,15 +279,51 @@ forge script script/DeployVault.s.sol \
   -vvvv
 ```
 
-See [`script/README.md`](../script/README.md) for full instructions on running the deployment script.
+`--broadcast` against `--fork-url` simulates the transactions in a forked context without actually sending them to mainnet. The post-deployment verification reads in the script (STEP G) confirm everything worked.
+
+### Option B — Persistent Anvil fork for integration testing
+
+```bash
+# Terminal 1 — start Anvil
+anvil --fork-url $RPC_URL --chain-id 1
+
+# Terminal 2 — run script against the fork
+export RPC_URL=http://127.0.0.1:8545
+export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80  # default Anvil acct 0
+export OWNER=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266                                # acct 0 address
+export BOT_WALLET=0x70997970C51812dc3A010C7d01b50e0d17dc79C8                           # acct 1 address
+forge script script/DeployVault.s.sol \
+  --rpc-url http://127.0.0.1:8545 \
+  --broadcast \
+  -vvvv
+```
+
+The persistent Anvil instance is also what the bot's Anvil-gated integration tests use. After the script finishes, set `ANVIL_RPC_URL=http://127.0.0.1:8545` and run `bun test` to exercise the chain reader and executor against the deployed vault.
 
 ---
 
-## Next Steps
+## Next steps — connect the bot
 
-Once the vault is deployed and verified:
+Once the vault and adapter are deployed and verified:
 
-1. **Configure the rebalancing bot** — Set `VAULT_ADDRESS` in your `.env` file to the deployed vault address
-2. **Deposit USDC** — Transfer USDC to the vault (via the vault's `deposit()` function)
-3. **Start the bot** — Run `bun run dev` to begin automated rebalancing
-4. **Monitor** — Check the `/health` and `/api/v1/status` endpoints, and watch for Telegram alerts
+1. **Update `.env`** with the deployed addresses:
+   ```bash
+   VAULT_ADDRESS=0x...     # printed by the script in STEP H
+   ADAPTER_ADDRESS=0x...   # printed by the script in STEP H
+   MANAGED_MARKETS_PATH=./managed-markets.json
+   ```
+2. **Save the `MANAGED_MARKETS_PATH` JSON** — copy the JSON block from the script's STEP H output into `managed-markets.json`. Confirm every entry's `oracle` is the value you actually want (the script doesn't validate the oracle, only `loanToken` and `irm`).
+3. **Start the bot** — `bun run dev`. The bot will:
+   - Load `MANAGED_MARKETS_PATH`
+   - Construct `VaultReader(publicClient, VAULT_ADDRESS, ADAPTER_ADDRESS, managedMarkets)`
+   - Call `vaultReader.assertStartupInvariants(BOT_WALLET)` which:
+     - Verifies the configured adapter is enabled on the vault
+     - Verifies `adapter.parentVault() == VAULT_ADDRESS`
+     - Verifies `vault.isAllocator(BOT_WALLET) == true`
+     - Verifies the locally computed cap ids match `adapter.ids(marketParams)` (catches abi-encoding bugs)
+     - Refuses to start if any `relativeCap == 0` with the explicit error message from [SPEC Story A2](../../SPEC.md)
+     - Excludes markets without `absoluteCap > 0` and logs `"ignored: no absolute cap configured"`
+4. **(Optional) Seed the vault with USDC** — `cast send $USDC "approve(address,uint256)" $VAULT 1000000000` then `cast send $VAULT "deposit(uint256,address)" 1000000000 $YOU`. The bot only operates on what's already in the vault.
+5. **Monitor** — `GET /api/v1/status` returns the per-market state (allocation, all 3 caps per market, percentage of total). Watch for Telegram alerts on rebalance executions and failures.
+
+For the bot's operational details, see the project [`README.md`](../../README.md), [`SPEC.md`](../../SPEC.md), and [`PLAN.md`](../../PLAN.md).

@@ -73,9 +73,9 @@ export class Notifier {
    *
    * Message includes:
    *   - Vault address
-   *   - Adapters affected and amounts moved (human-readable USDC)
+   *   - Markets affected and amounts moved (human-readable USDC)
    *   - Transaction hashes
-   *   - New allocation percentages
+   *   - New allocation percentages keyed by marketLabel
    */
   async notifyRebalanceSuccess(
     result: RebalanceResult,
@@ -95,7 +95,8 @@ export class Notifier {
       for (const action of result.actions) {
         const amountUsdc = formatUsdc(action.amount);
         const direction = action.direction === "allocate" ? "ALLOCATE" : "DEALLOCATE";
-        lines.push(`  • ${direction} \`${action.adapter}\` — ${amountUsdc} USDC`);
+        // Use marketLabel (human-readable) instead of adapter address
+        lines.push(`  • ${direction} *${action.marketLabel}* — ${amountUsdc} USDC`);
       }
       lines.push("");
     }
@@ -112,7 +113,8 @@ export class Notifier {
       lines.push("*New Allocations:*");
       for (const alloc of result.newAllocations) {
         const pct = alloc.percentage.toFixed(2);
-        lines.push(`  • \`${alloc.adapter}\` — ${pct}%`);
+        // Use marketLabel (human-readable) from the new newAllocations shape
+        lines.push(`  • *${alloc.marketLabel}* — ${pct}%`);
       }
       lines.push("");
     }
@@ -127,7 +129,7 @@ export class Notifier {
    *
    * Message includes:
    *   - Vault address
-   *   - Failing adapter (if known)
+   *   - Failing market (human-readable marketLabel, if known)
    *   - Error message (sanitised — no internal stack traces)
    *   - Transaction hash (if a tx was submitted before the failure)
    */
@@ -148,7 +150,8 @@ export class Notifier {
     if (failedAction) {
       const direction = failedAction.direction === "allocate" ? "ALLOCATE" : "DEALLOCATE";
       const amountUsdc = formatUsdc(failedAction.amount);
-      lines.push(`Failing action: ${direction} \`${failedAction.adapter}\` — ${amountUsdc} USDC`);
+      // Use marketLabel (human-readable) instead of adapter address
+      lines.push(`Failing action: ${direction} *${failedAction.marketLabel}* — ${amountUsdc} USDC`);
       lines.push("");
     }
 
@@ -206,10 +209,14 @@ export class Notifier {
    *   - On non-2xx HTTP response: log the status, return.
    *   - Never throws, never rejects.
    *
+   * The bot token is never logged — only the alert type and HTTP status appear
+   * in error messages.
+   *
    * Updates `lastSentAt` only after a successful send so that transient
    * failures do not reset the cooldown clock.
    */
   private async send(alertType: AlertType, text: string): Promise<void> {
+    // Construct the URL by interpolating only the token — never log this URL.
     const url = `${TELEGRAM_API_BASE}/bot${this.botToken}/sendMessage`;
 
     try {

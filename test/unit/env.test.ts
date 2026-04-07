@@ -22,6 +22,8 @@ const REQUIRED_ENV: Record<string, string> = {
   RPC_URL: "https://mainnet.infura.io/v3/test",
   PRIVATE_KEY: "a".repeat(64),
   VAULT_ADDRESS: "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01",
+  ADAPTER_ADDRESS: "0xDeAdBeEf0123456789AbCdEf0123456789AbCdEf",
+  MANAGED_MARKETS_PATH: "/tmp/managed-markets.json",
   TELEGRAM_BOT_TOKEN: "123456:ABC-test-token",
   TELEGRAM_CHAT_ID: "-100123456789",
 };
@@ -436,5 +438,180 @@ describe("DRY_RUN boolean coercion", () => {
     Object.assign(process.env, { ...REQUIRED_ENV, DRY_RUN: "0" });
     const { config } = await loadEnv();
     expect(config.DRY_RUN).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10. ADAPTER_ADDRESS — new required field (Group 8.1)
+// ---------------------------------------------------------------------------
+
+describe("ADAPTER_ADDRESS — new required field", () => {
+  it("parses successfully when ADAPTER_ADDRESS is a valid 0x-prefixed 20-byte address", async () => {
+    Object.assign(process.env, REQUIRED_ENV);
+    const { config } = await loadEnv();
+    expect(config.ADAPTER_ADDRESS).toBe(
+      "0xDeAdBeEf0123456789AbCdEf0123456789AbCdEf"
+    );
+  });
+
+  it("throws ZodError when ADAPTER_ADDRESS is absent", async () => {
+    const env = { ...REQUIRED_ENV };
+    delete env.ADAPTER_ADDRESS;
+    Object.assign(process.env, env);
+
+    await expect(loadEnv()).rejects.toBeInstanceOf(ZodError);
+  });
+
+  it("throws ZodError naming ADAPTER_ADDRESS when the field is absent", async () => {
+    const env = { ...REQUIRED_ENV };
+    delete env.ADAPTER_ADDRESS;
+    Object.assign(process.env, env);
+
+    let caught: unknown;
+    try {
+      await loadEnv();
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ZodError);
+    const zodErr = caught as ZodError;
+    const fieldNames = zodErr.issues.map((i) => i.path.join("."));
+    expect(fieldNames).toContain("ADAPTER_ADDRESS");
+  });
+
+  it("throws ZodError when ADAPTER_ADDRESS is not a 0x-prefixed hex address", async () => {
+    Object.assign(process.env, {
+      ...REQUIRED_ENV,
+      ADAPTER_ADDRESS: "not-an-address",
+    });
+    await expect(loadEnv()).rejects.toBeInstanceOf(ZodError);
+  });
+
+  it("throws ZodError when ADAPTER_ADDRESS is 0x-prefixed but too short (19 bytes)", async () => {
+    Object.assign(process.env, {
+      ...REQUIRED_ENV,
+      ADAPTER_ADDRESS: "0xDeAdBeEf0123456789AbCdEf0123456789AbCd",
+    });
+    await expect(loadEnv()).rejects.toBeInstanceOf(ZodError);
+  });
+
+  it("throws ZodError when ADAPTER_ADDRESS is 0x-prefixed but too long (21 bytes)", async () => {
+    Object.assign(process.env, {
+      ...REQUIRED_ENV,
+      ADAPTER_ADDRESS: "0xDeAdBeEf0123456789AbCdEf0123456789AbCdEfAa",
+    });
+    await expect(loadEnv()).rejects.toBeInstanceOf(ZodError);
+  });
+
+  it("throws ZodError when ADAPTER_ADDRESS has no 0x prefix", async () => {
+    Object.assign(process.env, {
+      ...REQUIRED_ENV,
+      ADAPTER_ADDRESS: "DeAdBeEf0123456789AbCdEf0123456789AbCdEf",
+    });
+    await expect(loadEnv()).rejects.toBeInstanceOf(ZodError);
+  });
+
+  it("ADAPTER_ADDRESS is not in the SENSITIVE_FIELDS redaction list", async () => {
+    Object.assign(process.env, REQUIRED_ENV);
+    const { safeConfig } = await loadEnv();
+    const safe = safeConfig();
+    // ADAPTER_ADDRESS is a non-sensitive field — must not be redacted
+    expect(safe.ADAPTER_ADDRESS).toBe(
+      "0xDeAdBeEf0123456789AbCdEf0123456789AbCdEf"
+    );
+  });
+
+  it("ZodError for invalid ADAPTER_ADDRESS does not expose PRIVATE_KEY in the message", async () => {
+    const privateKey = "b".repeat(64);
+    Object.assign(process.env, {
+      ...REQUIRED_ENV,
+      PRIVATE_KEY: privateKey,
+      ADAPTER_ADDRESS: "not-an-address",
+    });
+
+    let caught: unknown;
+    try {
+      await loadEnv();
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ZodError);
+    const errString = String(caught);
+    expect(errString).not.toContain(privateKey);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. MANAGED_MARKETS_PATH — new required field (Group 8.1)
+// ---------------------------------------------------------------------------
+
+describe("MANAGED_MARKETS_PATH — new required field", () => {
+  it("parses successfully when MANAGED_MARKETS_PATH is a non-empty string", async () => {
+    Object.assign(process.env, REQUIRED_ENV);
+    const { config } = await loadEnv();
+    expect(config.MANAGED_MARKETS_PATH).toBe("/tmp/managed-markets.json");
+  });
+
+  it("throws ZodError when MANAGED_MARKETS_PATH is absent", async () => {
+    const env = { ...REQUIRED_ENV };
+    delete env.MANAGED_MARKETS_PATH;
+    Object.assign(process.env, env);
+
+    await expect(loadEnv()).rejects.toBeInstanceOf(ZodError);
+  });
+
+  it("throws ZodError naming MANAGED_MARKETS_PATH when the field is absent", async () => {
+    const env = { ...REQUIRED_ENV };
+    delete env.MANAGED_MARKETS_PATH;
+    Object.assign(process.env, env);
+
+    let caught: unknown;
+    try {
+      await loadEnv();
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ZodError);
+    const zodErr = caught as ZodError;
+    const fieldNames = zodErr.issues.map((i) => i.path.join("."));
+    expect(fieldNames).toContain("MANAGED_MARKETS_PATH");
+  });
+
+  it("throws ZodError when MANAGED_MARKETS_PATH is an empty string", async () => {
+    Object.assign(process.env, { ...REQUIRED_ENV, MANAGED_MARKETS_PATH: "" });
+    await expect(loadEnv()).rejects.toBeInstanceOf(ZodError);
+  });
+
+  it("MANAGED_MARKETS_PATH accepts a relative path string", async () => {
+    Object.assign(process.env, {
+      ...REQUIRED_ENV,
+      MANAGED_MARKETS_PATH: "./config/managed-markets.json",
+    });
+    const { config } = await loadEnv();
+    expect(config.MANAGED_MARKETS_PATH).toBe("./config/managed-markets.json");
+  });
+
+  it("ZodError for missing MANAGED_MARKETS_PATH does not expose PRIVATE_KEY in the message", async () => {
+    const privateKey = "c".repeat(64);
+    const env: Record<string, string> = {
+      ...REQUIRED_ENV,
+      PRIVATE_KEY: privateKey,
+    };
+    delete env.MANAGED_MARKETS_PATH;
+    Object.assign(process.env, env);
+
+    let caught: unknown;
+    try {
+      await loadEnv();
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ZodError);
+    const errString = String(caught);
+    expect(errString).not.toContain(privateKey);
   });
 });

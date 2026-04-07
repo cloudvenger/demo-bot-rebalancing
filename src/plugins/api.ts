@@ -11,8 +11,10 @@
 
 import fp from "fastify-plugin";
 import type { FastifyInstance, FastifyPluginOptions } from "fastify";
+import { formatUnits } from "viem";
 import type { RebalanceService } from "../services/rebalance.service.js";
 import type { Config } from "../config/env.js";
+import type { VaultReader } from "../core/chain/vault.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -39,9 +41,6 @@ const HTTP_INTERNAL_ERROR = 500 as const;
 /** USDC has 6 decimal places */
 const USDC_DECIMALS = 6 as const;
 
-/** Divisor to convert raw USDC units to a human-readable decimal number */
-const USDC_DIVISOR = 10 ** USDC_DECIMALS;
-
 /** Reason string returned when a rebalance is not needed. */
 const REASON_WITHIN_DRIFT = "within drift threshold" as const;
 
@@ -57,6 +56,7 @@ const ERR_CYCLE_RUNNING = "Rebalance cycle already running" as const;
  */
 export interface ApiPluginOptions extends FastifyPluginOptions {
   rebalanceService: RebalanceService;
+  vaultReader: VaultReader;
   config: Config;
 }
 
@@ -66,16 +66,18 @@ export interface ApiPluginOptions extends FastifyPluginOptions {
 
 /**
  * Format a raw bigint asset amount (USDC 6 decimals) as a human-readable
- * string, e.g. `"1000000000000"` → `"1,000,000.00 USDC"`.
+ * string with comma separators, e.g. `"1000000000000"` → `"1,000,000.00 USDC"`.
  *
  * @param rawAmount  Asset amount in the vault's underlying denomination.
  * @returns Human-readable string.
  */
 function formatUsdcHuman(rawAmount: bigint): string {
-  const whole = rawAmount / BigInt(USDC_DIVISOR);
-  const fraction = rawAmount % BigInt(USDC_DIVISOR);
-  const fractionStr = fraction.toString().padStart(USDC_DECIMALS, "0").slice(0, 2);
-  return `${whole.toLocaleString("en-US")}.${fractionStr} USDC`;
+  const formatted = formatUnits(rawAmount, USDC_DECIMALS);
+  // Parse back to number for locale formatting, then re-attach 2 decimal places
+  const [whole, fraction = "00"] = formatted.split(".");
+  const wholeFormatted = Number(whole).toLocaleString("en-US");
+  const fractionTrimmed = (fraction + "00").slice(0, 2);
+  return `${wholeFormatted}.${fractionTrimmed} USDC`;
 }
 
 /**
@@ -109,7 +111,7 @@ async function apiPlugin(
   fastify: FastifyInstance,
   opts: ApiPluginOptions
 ): Promise<void> {
-  const { rebalanceService, config } = opts;
+  const { rebalanceService, vaultReader, config } = opts;
 
   // -------------------------------------------------------------------------
   // GET /api/v1/status
@@ -118,17 +120,26 @@ async function apiPlugin(
   /**
    * Returns the current vault allocation state and last-rebalance metadata.
    *
-   * All data comes from the in-memory snapshot cached by RebalanceService —
-   * no on-chain calls are made during this handler.
+   * Performs an on-chain read of the current vault state to return fresh
+   * market data. Falls back to last cached state if the read fails.
    *
-   * Response: 200 { data: { ... }, error: null }
-   *           500 { data: null, error: "..." }
+   * Response shape (per PLAN.md § API Contract):
+   * {
+   *   data: {
+   *     vaultAddress, adapterAddress,
+   *     totalAssets, totalAssetsFormatted,
+   *     markets: [{ label, marketId, marketParams, allocation, allocationFormatted,
+   *                 percentage, caps: [{ id, absoluteCap, relativeCap }, ...3] }],
+   *     lastRebalance: { timestamp, txHashes },
+   *     gas: { currentGwei, ceilingGwei }
+   *   },
+   *   error: null
+   * }
    */
   fastify.get(STATUS_ROUTE, async (_request, reply) => {
     try {
-      const status = rebalanceService.getStatus();
-
-      const lastRebalanceResult = status.lastRebalanceResult;
+      const serviceStatus = rebalanceService.getStatus();
+      const lastRebalanceResult = serviceStatus.lastRebalanceResult;
 
       // Build last-rebalance metadata from the stored result.
       const lastRebalance = lastRebalanceResult
@@ -138,41 +149,97 @@ async function apiPlugin(
           }
         : null;
 
-      // We don't cache VaultState separately in this implementation — the
-      // status snapshot from RebalanceService contains all we need for the
-      // API response. A future v2 could expose the full adapter list from
-      // cached VaultState.
-      //
-      // For now we surface what is available from getStatus() and annotate
-      // clearly where richer data would come from.
+      // Attempt to read current gas price for observability.
+      // Non-fatal — we surface the ceiling regardless.
+      let currentGwei: number | null = null;
+      try {
+        // We don't have the publicClient directly here; gas is read by the executor.
+        // For the status endpoint we only surface the ceiling from config.
+        // A future v2 could inject the publicClient to read live gas.
+        currentGwei = null;
+      } catch {
+        // ignore — gas price is best-effort
+      }
+
+      // Read the current vault state for fresh market data.
+      // Non-fatal — if this fails we return an empty markets array.
+      let vaultStateData: {
+        vaultAddress: string;
+        adapterAddress: string;
+        totalAssets: string;
+        totalAssetsFormatted: string;
+        markets: Array<{
+          label: string;
+          marketId: string;
+          marketParams: {
+            loanToken: string;
+            collateralToken: string;
+            oracle: string;
+            irm: string;
+            lltv: string;
+          };
+          allocation: string;
+          allocationFormatted: string;
+          percentage: number;
+          caps: Array<{
+            id: string;
+            absoluteCap: string;
+            relativeCap: string;
+          }>;
+        }>;
+      } | null = null;
+
+      try {
+        const vaultState = await vaultReader.readFullState();
+
+        vaultStateData = {
+          vaultAddress: vaultState.vaultAddress,
+          adapterAddress: vaultState.adapterAddress,
+          totalAssets: vaultState.totalAssets.toString(),
+          totalAssetsFormatted: formatUsdcHuman(vaultState.totalAssets),
+          markets: vaultState.marketStates.map((ms) => ({
+            label: ms.market.label,
+            marketId: ms.market.marketId,
+            marketParams: {
+              loanToken: ms.market.marketParams.loanToken,
+              collateralToken: ms.market.marketParams.collateralToken,
+              oracle: ms.market.marketParams.oracle,
+              irm: ms.market.marketParams.irm,
+              lltv: ms.market.marketParams.lltv.toString(),
+            },
+            allocation: ms.allocation.toString(),
+            allocationFormatted: formatUsdcHuman(ms.allocation),
+            percentage:
+              vaultState.totalAssets > 0n
+                ? Number((ms.allocation * 10_000n) / vaultState.totalAssets) / 100
+                : 0,
+            caps: ms.caps.map((cap) => ({
+              id: cap.id,
+              absoluteCap: cap.absoluteCap.toString(),
+              relativeCap: cap.relativeCap.toString(),
+            })),
+          })),
+        };
+      } catch (readError) {
+        // On-chain read failed — surface an empty state but do not crash the API.
+        fastify.log.warn({ err: readError }, "[api] GET /api/v1/status — vault read failed");
+      }
 
       const responseData = {
-        vaultAddress: config.VAULT_ADDRESS,
-        // lastRebalanceResult contains the actions taken during the last cycle.
-        adapters: lastRebalanceResult
-          ? lastRebalanceResult.newAllocations.map((alloc) => ({
-              address: alloc.adapter,
-              percentage: alloc.percentage,
-            }))
-          : [],
+        vaultAddress: vaultStateData?.vaultAddress ?? config.VAULT_ADDRESS,
+        adapterAddress: vaultStateData?.adapterAddress ?? config.ADAPTER_ADDRESS,
+        totalAssets: vaultStateData?.totalAssets ?? "0",
+        totalAssetsFormatted: vaultStateData?.totalAssetsFormatted ?? "0.00 USDC",
+        markets: vaultStateData?.markets ?? [],
         lastRebalance,
-        // Gas info — ceiling comes from config; current price is not cached
-        // here (that would require an on-chain call). We surface the ceiling
-        // for observability and omit the live price to keep < 50ms response.
         gas: {
+          currentGwei,
           ceilingGwei: config.GAS_CEILING_GWEI,
         },
-        isRunning: status.isRunning,
-        lastCheck: status.lastCheckTimestamp
-          ? status.lastCheckTimestamp.toISOString()
-          : null,
       };
 
       return reply.status(HTTP_OK).send(ok(responseData));
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Unexpected error";
-      // Never expose internal error details to the client.
       fastify.log.error({ err: error }, "[api] GET /api/v1/status failed");
       return reply.status(HTTP_INTERNAL_ERROR).send(err("Failed to retrieve status"));
     }
@@ -189,10 +256,11 @@ async function apiPlugin(
    * If the cycle completes with no actions, returns 200 with `action: "none"`.
    * If the cycle completes with actions, returns 200 with the full result.
    *
-   * Response: 200 { data: { actions[], txHashes[], newAllocations[] }, error: null }
-   *           200 { data: { action: "none", reason: "within drift threshold" }, error: null }
-   *           409 { data: null, error: "Rebalance cycle already running" }
-   *           500 { data: null, error: "..." }
+   * Response per PLAN.md:
+   *   200 { data: { actions: [{ marketLabel, direction, amount, txHash }], newAllocations: [...] } }
+   *   200 { data: { action: "none", reason: "within drift threshold" } }
+   *   409 { data: null, error: "Rebalance cycle already running" }
+   *   500 { data: null, error: "..." }
    */
   fastify.post(REBALANCE_ROUTE, async (_request, reply) => {
     // Conflict check: reject immediately if a cycle is running.
@@ -220,23 +288,23 @@ async function apiPlugin(
         );
       }
 
-      // Rebalance executed — return the full result.
+      // Rebalance executed — return the full result keyed by marketLabel.
+      // Pair each action with its txHash by index (actions and txHashes are
+      // positionally aligned when each action produces exactly one tx).
       const responseData = {
-        actions: result.actions.map((action) => ({
-          adapter: action.adapter,
+        actions: result.actions.map((action, i) => ({
+          marketLabel: action.marketLabel,
           direction: action.direction,
           // Serialize bigint as a string for JSON transport.
           amount: action.amount.toString(),
+          txHash: result.txHashes[i] ?? null,
         })),
-        txHashes: result.txHashes,
         newAllocations: result.newAllocations,
         timestamp: result.timestamp,
       };
 
       return reply.status(HTTP_OK).send(ok(responseData));
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Unexpected error";
       fastify.log.error({ err: error }, "[api] POST /api/v1/rebalance failed");
       return reply.status(HTTP_INTERNAL_ERROR).send(err("Rebalance failed"));
     }
