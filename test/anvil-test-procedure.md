@@ -141,20 +141,45 @@ The script also runs **STEP G — Verifying deployment**. If it logs `All verifi
 
 ## Step 5 — Run the Anvil-gated integration tests
 
+Export the two addresses that STEP H printed in Step 4, **even if they match the ones you set earlier** — the script prints the real CREATE2-derived values, which must match exactly:
+
 ```bash
+export VAULT_ADDRESS=0x...     # ← from STEP H "Vault:"   in Step 4 output
+export ADAPTER_ADDRESS=0x...   # ← from STEP H "Adapter:" in Step 4 output
 export ANVIL_RPC_URL=http://127.0.0.1:8545
-# VAULT_ADDRESS, ADAPTER_ADDRESS, BOT_WALLET still set from step 4
-# MANAGED_MARKETS_PATH still set from step 4
+# BOT_WALLET and MANAGED_MARKETS_PATH still set from Step 4
+```
+
+Sanity-check that all five required env vars are non-empty before invoking `just test`:
+
+```bash
+for v in VAULT_ADDRESS ADAPTER_ADDRESS BOT_WALLET MANAGED_MARKETS_PATH ANVIL_RPC_URL; do
+  printf '%-22s = %s\n' "$v" "${!v:-<UNSET>}"
+done
+```
+
+If any show `<UNSET>`, export them before continuing. Then run:
+
+```bash
 just test
 ```
 
 Expected: **412 tests, 0 skipped, 0 failed** (the 14 tests that were previously skipped now run because `ANVIL_RPC_URL` is set).
 
+> ⚠ **Common footgun — `ADAPTER_ADDRESS` not exported.** The Anvil-fork tests read `VAULT_ADDRESS` / `ADAPTER_ADDRESS` / `BOT_WALLET` from `process.env` and fall back to the mocked unit-test placeholders (`0x1111...`, `0x2222...`) when unset. If you see an error like:
+>
+> ```
+> Refusing to start: configured ADAPTER_ADDRESS 0x2222222222222222222222222222222222222222
+> is not enabled on vault 0x68bD...  Enabled adapters: [0x52958a...].
+> ```
+>
+> the fallback placeholder leaked through — export `ADAPTER_ADDRESS` from the STEP H summary and re-run. The real deployed adapter is shown in the "Enabled adapters" list in the error message.
+
 If any of the 14 newly-running tests fails, the failure tells you what part of the V2 contract interaction is broken. The most likely culprits:
 
 | Failing test | Likely cause |
 |---|---|
-| `assertStartupInvariants — happy path` | The deployed vault is missing something the script should have set up. Re-check STEP G logs. |
+| `assertStartupInvariants — happy path` | The deployed vault is missing something the script should have set up. Re-check STEP G logs, or `ADAPTER_ADDRESS` is unset (see callout above). |
 | `readFullState` allocation/cap reads | ABI mismatch in [`src/config/constants.ts`](../src/config/constants.ts) against the real V2 contract. |
 | `Executor` 3-arg `allocate` | The 3-arg signature is wrong, or `MARKET_PARAMS_ABI_COMPONENTS` produces a different encoding than the on-chain adapter expects. |
 
