@@ -88,7 +88,7 @@
 
 - [ ] [backend] Update [src/config/env.ts](src/config/env.ts) — add `ADAPTER_ADDRESS` (required Address) and `MANAGED_MARKETS_PATH` (required string)
 - [ ] [backend] Create `src/config/managed-markets.ts` — load + zod-validate the JSON file referenced by `MANAGED_MARKETS_PATH` into a `ManagedMarket[]`
-- [ ] [backend] Create `.env.example` entries for `ADAPTER_ADDRESS` and `MANAGED_MARKETS_PATH`, and add a sample `managed-markets.example.json`
+- [ ] [backend] Create `.env.example` entries for `ADAPTER_ADDRESS` and `MANAGED_MARKETS_PATH`, and add a sample `managed-markets.example.json` (sample uses `relativeCap: "1000000000000000000"` (= WAD) to demonstrate the "no relative cap" default — never `0`)
 - [ ] [backend] Rewrite [src/core/rebalancer/types.ts](src/core/rebalancer/types.ts):
   - Remove `AdapterState`, `AdapterType`
   - Add `MarketParams`, `ManagedMarket`, `MarketAllocationState` (per PLAN.md § Domain Types)
@@ -106,6 +106,7 @@
 - [ ] [backend] Rewrite [src/core/chain/vault.ts](src/core/chain/vault.ts):
   - Constructor takes `(publicClient, vaultAddress, adapterAddress, managedMarkets)`
   - At startup: assert the configured adapter is enabled (enumerate `adaptersAt` over `adaptersLength`), assert `adapter.parentVault() == vaultAddress`, assert `vault.isAllocator(botWallet) == true`
+  - **At startup, for every managed market, read `vault.relativeCap(id)` for all 3 ids and refuse to start if any returns `0n`.** Throw a `StartupValidationError` with the exact message format from SPEC Story A2: `"Refusing to start: market <label> has relativeCap == 0 on cap id <id>. This forbids any allocation to this market. If you meant 'no relative cap', set relativeCap to WAD (1e18). If you meant to forbid this market, remove it from MANAGED_MARKETS."` Markets with `absoluteCap == 0` on any id are silently excluded from the rebalance loop and logged as `"ignored: no absolute cap configured"` (per SPEC Story A2).
   - Per cycle: multicall reads `vault.totalAssets()`, then for each managed market: `vault.allocation(marketSpecificId)` and `vault.absoluteCap(id) + vault.relativeCap(id)` for **all 3 ids** returned by `adapter.ids(marketParams)`
   - **Read both caps as `bigint` (uint256). Do not cast `relativeCap` to `Number` — it is a WAD value and would lose precision.**
   - Compute all 3 ids off-chain in TypeScript using viem `encodeAbiParameters` + `keccak256`, with the verified preimages from PLAN.md § Verified cap-id preimages. At startup, assert that the locally computed ids match `adapter.ids(marketParams)` exactly — if any mismatch, abort.
@@ -140,7 +141,8 @@
   - `vault.setCurator(curator)` (owner-only, not timelocked)
   - One `vault.multicall([...])` from the curator that wraps: `submit(addAdapter)` + `addAdapter`; for each managed market, for **each of the 3 ids** in `adapter.ids(marketParams)`: `submit(increaseAbsoluteCap)` + `increaseAbsoluteCap(idData, cap)` + same for relative cap; `submit(setIsAllocator)` + `setIsAllocator(botWallet, true)`
   - **Build `idData` using the verified preimages from PLAN.md § Verified cap-id preimages.** In Solidity: `abi.encode("this", adapter)`, `abi.encode("collateralToken", marketParams.collateralToken)`, `abi.encode("this/marketParams", adapter, marketParams)`. Off-by-one in the preimage = wasted gas + reverting allocate at runtime.
-  - **Pass `relativeCap` in WAD**, not basis points. Use `WAD = 1e18` for "no cap" or `5e17` for 50%. Never pass 0 unless you intend to forbid the market.
+  - **Pass `relativeCap` in WAD**, not basis points. **Default to `WAD` (`1e18`) for every cap id** unless the operator explicitly overrides per market in the JSON config. WAD means "no relative cap, rely on absoluteCap as the hard ceiling" and ensures the script never accidentally writes a `relativeCap == 0` (which the bot will refuse to start against — see Story A2). Operators wanting an explicit relative cap can pass values like `5e17` for 50%.
+  - The script must `console.log` a final summary including the `relativeCap` value used per market in both raw WAD and human-readable percent, so operators visually catch unintended `0` values before broadcasting on mainnet.
   - Read managed markets from a JSON file via `vm.readFile` + `vm.parseJsonAddress` etc., or from env vars
   - Log the deployed `vault`, `adapter`, and the resulting `managed-markets.json` content the operator should copy into the bot config
 - [ ] [docs] Rewrite [script/README.md](script/README.md) — explain the curator role, the timelock=0 default, the multicall flow, and the env vars (`OWNER`, `BOT_WALLET`, `MANAGED_MARKETS_JSON`, etc.)

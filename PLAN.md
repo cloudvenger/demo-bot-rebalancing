@@ -288,7 +288,7 @@ require(
 | Field | Unit | Notes |
 |---|---|---|
 | `absoluteCap` | uint256 in the vault asset's native decimals (e.g., USDC: 6 decimals) | **Must be > 0 for every id** the adapter returns, otherwise `allocate` reverts. Stored on-chain as `uint128` (`uint256` in the API for headroom). |
-| `relativeCap` | uint256 in **WAD** (`1e18` = 100%). Example: 50% = `5e17`. | **NOT basis points.** The sentinel `relativeCap == WAD` means "no relative cap" and short-circuits the check. `relativeCap == 0` means `allocation <= 0` — effectively forbids the market. The bot must default new managed markets to a real WAD value (e.g. `WAD` for "unlimited" or `5e17` for 50%), never 0. |
+| `relativeCap` | uint256 in **WAD** (`1e18` = 100%). Example: 50% = `5e17`. | **NOT basis points.** The sentinel `relativeCap == WAD` means "no relative cap" and short-circuits the check. `relativeCap == 0` means `allocation <= 0` — effectively forbids the market. **Deploy script default: `WAD`** (per SPEC § Open Questions, decided 2026-04-07). **The bot refuses to start** if any managed market has `relativeCap == 0` on any of its 3 ids — this is treated as a misconfiguration with an explicit error message naming the market label and the offending cap id (per SPEC Story A2). |
 
 > **No `realAssets()` per market — the bot reads `vault.allocation(id)` instead.**
 
