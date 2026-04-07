@@ -73,7 +73,7 @@ export const MARKET_PARAMS_ABI_COMPONENTS = [
  *   Reads:
  *     totalAssets()               — total assets under management
  *     adaptersLength()            — count of enabled adapters (startup check)
- *     adaptersAt(uint256)         — adapter address at index (startup check)
+ *     adapters(uint256)           — adapter address at index (public array getter)
  *     absoluteCap(bytes32)        — hard ceiling for a cap id (in asset decimals)
  *     relativeCap(bytes32)        — soft ceiling in WAD (1e18 = 100%, NOT basis pts)
  *     allocation(bytes32)         — current allocation accounted for a cap id
@@ -87,7 +87,7 @@ export const VAULT_V2_ABI = parseAbi([
   // ---- Reads ---------------------------------------------------------------
   "function totalAssets() external view returns (uint256)",
   "function adaptersLength() external view returns (uint256)",
-  "function adaptersAt(uint256 index) external view returns (address)",
+  "function adapters(uint256 index) external view returns (address)",
   "function absoluteCap(bytes32 id) external view returns (uint256)",
   "function relativeCap(bytes32 id) external view returns (uint256)",
   "function allocation(bytes32 id) external view returns (uint256)",

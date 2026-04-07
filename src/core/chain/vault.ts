@@ -203,7 +203,7 @@ export class VaultReader {
    * Must be called once at startup, before the first rebalance cycle.
    *
    * Steps (in order):
-   *   1. Assert ADAPTER_ADDRESS is listed in vault.adaptersAt(0..n).
+   *   1. Assert ADAPTER_ADDRESS is listed in vault.adapters(0..n).
    *   2. Assert adapter.parentVault() == vaultAddress.
    *   3. Assert vault.isAllocator(botWallet) == true.
    *   4. For each managed market: compute 3 cap ids locally and assert they
@@ -372,7 +372,7 @@ export class VaultReader {
   // -------------------------------------------------------------------------
 
   /**
-   * Enumerates vault.adaptersAt(0..adaptersLength()) and asserts the configured
+   * Enumerates vault.adapters(0..adaptersLength()) and asserts the configured
    * adapterAddress is present.
    */
   private async _assertAdapterEnabled(): Promise<void> {
@@ -395,11 +395,11 @@ export class VaultReader {
       );
     }
 
-    // Multicall adaptersAt(0..n-1) for a consistent snapshot.
+    // Multicall adapters(0..n-1) for a consistent snapshot.
     const indexCalls = Array.from({ length: count }, (_, i) => ({
       address: this.vaultAddress,
       abi: VAULT_V2_ABI,
-      functionName: "adaptersAt" as const,
+      functionName: "adapters" as const,
       args: [BigInt(i)] as const,
     }));
 
