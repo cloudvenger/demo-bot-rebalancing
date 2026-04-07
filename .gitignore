@@ -37,7 +37,8 @@ npm-debug.log*
 
 # Foundry
 script/out/
-lib/
+lib/*
+!lib/forge-std
 cache/
 
 # Temporary files
