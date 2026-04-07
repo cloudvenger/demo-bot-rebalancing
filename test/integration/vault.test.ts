@@ -986,22 +986,38 @@ describe.skipIf(!FORK)("VaultReader against Anvil fork", () => {
       // Dynamic require — works in Node/Bun at runtime; not available at compile time.
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const raw = require("fs").readFileSync(path, "utf8");
-      const parsed: Array<{ label: string; marketParams: MarketParams }> =
-        JSON.parse(raw).markets;
-      return parsed.map((m) => ({
-        label: m.label,
-        marketParams: {
-          ...m.marketParams,
-          lltv: BigInt(m.marketParams.lltv as unknown as string),
-        },
-        marketId: keccak256(
-          encodeAbiParameters(
-            [{ type: "tuple", components: MARKET_PARAMS_ABI_COMPONENTS }],
-            [m.marketParams]
-          )
-        ) as Hash,
-        capIds: [],
-      }));
+      // Shape matches script/DeployVault.s.sol and its STEP H logged output:
+      // a top-level array with fields at the root (no { markets: [...] } wrapper,
+      // no nested marketParams object). lltv is stored as a decimal string so
+      // the JSON stays strictly valid.
+      const parsed: Array<{
+        label: string;
+        loanToken: `0x${string}`;
+        collateralToken: `0x${string}`;
+        oracle: `0x${string}`;
+        irm: `0x${string}`;
+        lltv: string;
+      }> = JSON.parse(raw);
+      return parsed.map((m) => {
+        const marketParams: MarketParams = {
+          loanToken: m.loanToken,
+          collateralToken: m.collateralToken,
+          oracle: m.oracle,
+          irm: m.irm,
+          lltv: BigInt(m.lltv),
+        };
+        return {
+          label: m.label,
+          marketParams,
+          marketId: keccak256(
+            encodeAbiParameters(
+              [{ type: "tuple", components: MARKET_PARAMS_ABI_COMPONENTS }],
+              [marketParams]
+            )
+          ) as Hash,
+          capIds: [],
+        };
+      });
     }
 
     // Default: use the two USDC markets from this file's fixtures.
@@ -1039,7 +1055,7 @@ describe.skipIf(!FORK)("VaultReader against Anvil fork", () => {
 
   it("throws StartupValidationError when ADAPTER_ADDRESS is not enabled on the fork vault", async () => {
     const client = buildForkClient();
-    const WRONG_ADAPTER: Address = "0xDeAdBeEfDeAdBeEfDeAdBeEfDeAdBeEfDeAdBeEf";
+    const WRONG_ADAPTER: Address = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
     const markets = loadForkManagedMarkets();
     const reader = new VaultReader(client, FORK_VAULT, WRONG_ADAPTER, markets);
 
@@ -1053,7 +1069,7 @@ describe.skipIf(!FORK)("VaultReader against Anvil fork", () => {
   // -------------------------------------------------------------------------
 
   it("throws StartupValidationError when bot wallet is not an allocator on the fork vault", async () => {
-    const NOT_ALLOCATOR: Address = "0xDeAdBeEfDeAdBeEfDeAdBeEfDeAdBeEfDeAdBeEf";
+    const NOT_ALLOCATOR: Address = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
     const client = buildForkClient();
     const markets = loadForkManagedMarkets();
     const reader = new VaultReader(client, FORK_VAULT, FORK_ADAPTER, markets);
