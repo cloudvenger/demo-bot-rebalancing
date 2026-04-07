@@ -114,7 +114,7 @@ interface IVaultV2 {
     /// @notice Return the adapter at the given index.
     /// @param index Zero-based index into the adapters set
     /// @return      The adapter address
-    function adaptersAt(uint256 index) external view returns (address);
+    function adapters(uint256 index) external view returns (address);
 
     /// @notice Return the absolute cap for the given cap id.
     /// @param id The cap id (keccak256 of the preimage)
@@ -515,8 +515,8 @@ contract DeployVault is Script {
         if (IVaultV2(vault).adaptersLength() != 1) {
             revert VerificationFailed("adaptersLength != 1");
         }
-        if (IVaultV2(vault).adaptersAt(0) != adapter) {
-            revert VerificationFailed("adaptersAt(0) != adapter");
+        if (IVaultV2(vault).adapters(0) != adapter) {
+            revert VerificationFailed("adapters(0) != adapter");
         }
         if (!IVaultV2(vault).isAllocator(botWallet)) {
             revert VerificationFailed("botWallet is not an allocator");
