@@ -128,12 +128,27 @@ forge script script/DeployVault.s.sol --tc DeployVault \
 >
 > `--private-key $PRIVATE_KEY` is **required** — without it, forge has no signer for the `vm.startBroadcast(OWNER)` address and silently skips the broadcast phase after the local simulation. STEP G/H still print a valid-looking summary (they run against the in-memory simulation state), but nothing reaches Anvil, so Step 5's integration tests fail with `adaptersLength returned no data` on an empty vault address. If you see `receipts: 0` in `broadcast/DeployVault.s.sol/1/run-latest.json` after a run, this is what happened. The `PRIVATE_KEY` must control the `OWNER` address from Step 1's table.
 
-Look for the **DEPLOYMENT SUMMARY** block in the output. Capture two addresses:
+Look for the **DEPLOYMENT SUMMARY** block in the output. Capture two addresses — either by eyeballing STEP H:
 
 ```bash
 export VAULT_ADDRESS=0x...      # printed as "Vault:    " in STEP H
 export ADAPTER_ADDRESS=0x...    # printed as "Adapter:  " in STEP H
 ```
+
+…or, more reliably, by extracting them from forge's broadcast artifact (no copy/paste, always matches the last successful run):
+
+```bash
+export VAULT_ADDRESS=$(jq -r '[.transactions[] | .additionalContracts[]?.address] | .[0]' \
+  broadcast/DeployVault.s.sol/1/run-latest.json)
+
+export ADAPTER_ADDRESS=$(jq -r '[.transactions[] | .additionalContracts[]?.address] | .[1]' \
+  broadcast/DeployVault.s.sol/1/run-latest.json)
+
+echo "VAULT_ADDRESS=$VAULT_ADDRESS"
+echo "ADAPTER_ADDRESS=$ADAPTER_ADDRESS"
+```
+
+The artifact is written by forge whenever the script is re-run with `--broadcast`, so these two commands always reflect the most recent deploy without any manual transcription.
 
 The script also runs **STEP G — Verifying deployment**. If it logs `All verifications passed.`, the vault has the adapter enabled, all 3 cap ids per market have `absoluteCap > 0` AND `relativeCap == WAD`, and the bot wallet has the allocator role. If it reverts with `VerificationFailed(...)`, fix the inputs and re-run (the reverted script left no state behind because Anvil's snapshot mechanism rolls back failed broadcast txs).
 
@@ -248,6 +263,10 @@ Stop the bot with `Ctrl+C`. ✅ smoke test done.
 
 The previous step proves the read path works. To prove `allocate` works against a real Morpho Blue market, the vault needs USDC. The cleanest way on a fork is to impersonate a USDC whale:
 
+> ⚠ **Deposit must stay under the adapter-wide absolute cap.** The deploy script defaults `ABSOLUTE_CAP=500_000e6` (500k USDC) and applies it to **all 3 cap ids per market, including `id[0]` adapter-wide**. The adapter-wide id is a single running total across every `allocate(...)` call on this adapter, regardless of which market it targets. If you deposit 1M USDC and the bot tries to deploy it all, the cumulative adapter-wide counter will cross 500k on the second (or third) `allocate` call and revert with `AbsoluteCapExceeded() (0x4616e4af)`.
+>
+> We deposit **400k USDC** below so the bot can fully allocate all of it without touching the cap. If you want to test with 1M or more, redeploy Step 4 with `export ABSOLUTE_CAP=5000000000000` (5M USDC) first.
+
 ```bash
 # A well-known USDC whale (Circle treasury). Verify on Etherscan if it's still funded.
 export USDC_WHALE=0x55FE002aefF02F77364de339a1292923A15844B8
@@ -259,17 +278,17 @@ cast rpc anvil_impersonateAccount $USDC_WHALE --rpc-url $RPC_URL
 # Step 7b — fund the whale with ETH for gas (anvil cheat)
 cast rpc anvil_setBalance $USDC_WHALE 0xDE0B6B3A7640000 --rpc-url $RPC_URL    # 1 ETH
 
-# Step 7c — whale approves the vault to pull USDC
+# Step 7c — whale approves the vault to pull USDC (400k, 6 decimals)
 cast send $USDC \
   "approve(address,uint256)" \
-  $VAULT_ADDRESS 1000000000000 \
+  $VAULT_ADDRESS 400000000000 \
   --from $USDC_WHALE --unlocked \
   --rpc-url $RPC_URL
 
-# Step 7d — whale deposits 1,000,000 USDC into the vault on its own behalf
+# Step 7d — whale deposits 400,000 USDC into the vault on its own behalf
 cast send $VAULT_ADDRESS \
   "deposit(uint256,address)" \
-  1000000000000 $USDC_WHALE \
+  400000000000 $USDC_WHALE \
   --from $USDC_WHALE --unlocked \
   --rpc-url $RPC_URL
 
@@ -278,7 +297,7 @@ cast rpc anvil_stopImpersonatingAccount $USDC_WHALE --rpc-url $RPC_URL
 
 # Confirm the deposit
 cast call $VAULT_ADDRESS "totalAssets()(uint256)" --rpc-url $RPC_URL
-# → 1000000000000  (1,000,000 USDC)
+# → 400000000000  (400,000 USDC)
 ```
 
 Now turn `DRY_RUN` off and rerun the bot:
@@ -288,20 +307,39 @@ unset DRY_RUN   # or: export DRY_RUN=false
 just dev
 ```
 
-On the next cron tick the bot should compute a rebalance and submit a real `vault.allocate(adapter, abi.encode(marketParams), assets)` call against the Anvil fork. Watch the logs for:
+On the next cron tick the bot should compute a rebalance and submit real `vault.allocate(adapter, abi.encode(marketParams), assets)` calls against the Anvil fork. Watch the logs for:
 
 ```
-[RebalanceService] executing 1 action(s)
-[RebalanceService] rebalance complete — 1 tx(s) submitted
+[RebalanceService] executing N action(s)
+[RebalanceService] rebalance complete — N tx(s) submitted
 ```
+
+`N` depends on how the strategy splits the 400k USDC across active markets (typically 1–3).
 
 Then verify the on-chain state:
 
 ```bash
 # Easiest: read it from the bot via the status endpoint:
-curl -s http://localhost:3000/api/v1/status | jq '.data.markets[0].allocation'
-# → "1000000000000"   (or close to it, depending on cap clamping)
+curl -s http://localhost:3000/api/v1/status | jq '.data.markets[] | {label, allocation}'
+# → each managed market's label + allocation in micro-USDC
 ```
+
+Summed allocations should be close to `400000000000` (allow a few wei of ERC-4626 rounding).
+
+> 💡 **If you already deposited 1M USDC in an earlier attempt** and hit `AbsoluteCapExceeded`, you don't need to restart Anvil. Have the whale redeem 600k back:
+>
+> ```bash
+> cast rpc anvil_impersonateAccount $USDC_WHALE --rpc-url $RPC_URL
+> cast send $VAULT_ADDRESS \
+>   "withdraw(uint256,address,address)" \
+>   600000000000 $USDC_WHALE $USDC_WHALE \
+>   --from $USDC_WHALE --unlocked \
+>   --rpc-url $RPC_URL
+> cast rpc anvil_stopImpersonatingAccount $USDC_WHALE --rpc-url $RPC_URL
+>
+> cast call $VAULT_ADDRESS "totalAssets()(uint256)" --rpc-url $RPC_URL
+> # → 400000000000
+> ```
 
 Stop the bot with `Ctrl+C`. ✅ execute path validated.
 
