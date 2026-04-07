@@ -119,11 +119,14 @@ export MANAGED_MARKETS_PATH=$(pwd)/managed-markets.anvil.json
 
 forge script script/DeployVault.s.sol --tc DeployVault \
   --rpc-url $RPC_URL \
+  --private-key $PRIVATE_KEY \
   --broadcast \
   -vvvv
 ```
 
 > `--tc DeployVault` is required because the script file also contains a `JsonMarketProbe` helper contract used to count entries in the JSON config; without `--tc`, forge errors with "Multiple contracts in the target path".
+>
+> `--private-key $PRIVATE_KEY` is **required** — without it, forge has no signer for the `vm.startBroadcast(OWNER)` address and silently skips the broadcast phase after the local simulation. STEP G/H still print a valid-looking summary (they run against the in-memory simulation state), but nothing reaches Anvil, so Step 5's integration tests fail with `adaptersLength returned no data` on an empty vault address. If you see `receipts: 0` in `broadcast/DeployVault.s.sol/1/run-latest.json` after a run, this is what happened. The `PRIVATE_KEY` must control the `OWNER` address from Step 1's table.
 
 Look for the **DEPLOYMENT SUMMARY** block in the output. Capture two addresses:
 
