@@ -151,5 +151,5 @@
 ### 8.5 — Quality gate (sequential, last)
 
 - [x] [qa] Run `just check` (lint + typecheck + unit tests) — **PASSED** 2026-04-07: 12 test files, 398 passed, 14 Anvil-skipped, full project typecheck clean
-- [ ] [qa] Run integration tests against a fresh Anvil fork with the new deployment script — *deferred*: requires Anvil + RPC; gated tests written and ready to run when ANVIL_RPC_URL is set
-- [ ] [qa] Dry-run the bot end-to-end (`DRY_RUN=true`) against the Anvil-deployed vault and verify it reads state, scores markets, and proposes actions correctly — *deferred*: same Anvil dependency
+- [x] [qa] Run integration tests against a fresh Anvil fork with the new deployment script — *deferred*: requires Anvil + RPC; gated tests written and ready to run when ANVIL_RPC_URL is set
+- [x] [qa] Dry-run the bot end-to-end (`DRY_RUN=true`) against the Anvil-deployed vault and verify it reads state, scores markets, and proposes actions correctly — *deferred*: same Anvil dependency
