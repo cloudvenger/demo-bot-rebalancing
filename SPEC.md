@@ -22,24 +22,28 @@ Solo DeFi vault operators managing Morpho V2 vaults must manually monitor market
 
 ### Feature Area: Vault State Reading
 
-**Story A1** — Read current allocations
-As a vault operator, I want the bot to read the current allocation state of my vault (per-adapter assets, total assets, cap limits) so that it has an accurate picture before computing any rebalance.
+> **V2 model note** — Morpho Vault V2 uses a **single adapter per protocol** that routes allocations to many Morpho Blue markets via `MarketParams` encoded in the call data. The bot manages **one adapter address** and **N managed markets** configured at startup, not N adapters. See [PLAN.md § Morpho V2 Contract Interactions](PLAN.md#morpho-v2-contract-interactions) for the verified ABI.
+
+**Story A1** — Read current per-market allocations
+As a vault operator, I want the bot to read the current allocation state of my vault (per-market assets, total assets, cap limits) so that it has an accurate picture before computing any rebalance.
 
 Acceptance criteria:
-- [ ] Bot reads `realAssets()` for every enabled adapter on the configured vault
-- [ ] Bot reads `totalAssets()` on the vault contract
-- [ ] Bot reads absolute and relative caps via `caps(id)` for each risk ID
-- [ ] Bot reads market rates and utilization from Morpho Blue `market()` view for each underlying market
-- [ ] All reads complete within a single block snapshot (consistent state)
+- [ ] Bot reads `vault.totalAssets()` on the vault contract
+- [ ] For each managed market, bot reads `vault.allocation(id)` where `id = keccak256(abi.encode("this/marketParams", adapter, marketParams))` — the market-specific cap id exposed by `MorphoMarketV1AdapterV2`
+- [ ] For each managed market, bot reads `vault.absoluteCap(id)` and `vault.relativeCap(id)` for **all 3 ids** the adapter exposes via `ids(marketParams)`: the adapter-wide id, the collateral-token id, and the market-specific id (every id must have absoluteCap > 0 for `allocate` to succeed)
+- [ ] Bot reads market rates and utilization from Morpho Blue `market(Id)` view for each managed market
+- [ ] All reads complete within a single multicall block snapshot (consistent state)
 - [ ] If RPC call fails, bot retries up to 3 times with exponential backoff before alerting
 
-**Story A2** — Read enabled adapters
-As a vault operator, I want the bot to automatically discover all enabled adapters on my vault so that I don't have to manually configure market lists.
+**Story A2** — Configure managed markets
+As a vault operator, I want to configure the list of Morpho Blue markets the bot manages so that I have explicit control over which markets receive allocations.
 
 Acceptance criteria:
-- [ ] Bot queries the vault for the list of enabled adapters
-- [ ] Bot identifies adapter type (MorphoMarketV1AdapterV2 vs MorphoVaultV1Adapter)
-- [ ] New adapters added to the vault are picked up on next cron cycle without restart
+- [ ] Bot reads a single `ADAPTER_ADDRESS` env var pointing to the `MorphoMarketV1AdapterV2` deployed for the configured vault
+- [ ] Bot reads a `MANAGED_MARKETS` config (env var or JSON file) listing the `MarketParams` (loanToken, collateralToken, oracle, irm, lltv) for every market the bot should consider
+- [ ] At startup, bot validates each managed market by reading `adapter.ids(marketParams)` and verifying every returned id has `absoluteCap > 0` on the vault — markets with no cap are logged as "ignored: no cap configured" and excluded from the rebalance loop
+- [ ] Bot validates that the configured `ADAPTER_ADDRESS` is enabled on the vault (via `vault.adaptersAt(i)` enumeration over `vault.adaptersLength()`)
+- [ ] Adding a new market requires updating config and restarting the bot (dynamic discovery deferred to v2)
 
 ---
 
@@ -49,30 +53,31 @@ Acceptance criteria:
 As a vault operator, I want the bot to compute the optimal allocation across markets based on yield, market depth, and constraints so that my vault earns the best risk-adjusted return without moving markets or getting trapped in illiquid positions.
 
 Acceptance criteria:
-- [ ] Strategy scores each market by **projected post-rebalance APY** (not current APY)
+- [ ] Strategy scores **each managed market** by **projected post-rebalance APY** (not current APY)
 - [ ] Strategy reads IRM (Interest Rate Model) parameters from on-chain once per cycle, then computes projected rates off-chain in TypeScript (hybrid IRM approach)
 - [ ] Strategy reads total supply, total borrow, and available liquidity per market
 - [ ] Strategy rejects markets where available liquidity < configurable minimum (default: 2x the bot's potential allocation to that market)
 - [ ] Strategy caps allocation to any single market at configurable % of that market's total supply (default: 10%) to limit rate impact
 - [ ] Strategy simulates post-rebalance utilization and uses the projected APY for scoring
 - [ ] Scoring formula: `score = projected_APY × liquidity_safety_factor × (1 - concentration_penalty)` where liquidity_safety_factor = `min(1, available_liquidity / (2 × allocation))` and concentration_penalty = `your_assets / market_total_supply` above threshold
-- [ ] Strategy respects absolute cap constraints (no adapter exceeds its absolute cap)
-- [ ] Strategy respects relative cap constraints (no adapter exceeds its % of total assets)
-- [ ] Strategy computes a delta (target - current) for each adapter
-- [ ] If all adapters are within drift threshold, no rebalance is triggered
+- [ ] Strategy respects the **absolute cap** for every cap id the adapter exposes for the market (a target that would breach any one of the 3 ids is clamped to the most restrictive one)
+- [ ] Strategy respects the **relative cap** for every cap id (clamped against `vault.totalAssets()`)
+- [ ] Strategy computes a delta (target − current) for each managed market
+- [ ] If every market is within drift threshold, no rebalance is triggered
 - [ ] Drift threshold is configurable via environment variable (default: 5%)
 
 **Story B2** — Execute rebalance transactions
 As a vault operator, I want the bot to submit rebalance transactions on-chain so that allocations are adjusted without manual intervention.
 
 Acceptance criteria:
-- [ ] Bot calls `deallocate()` first for all overweight adapters (delta < 0) to fill the idle pool
-- [ ] Bot then calls `allocate()` for all underweight adapters (delta > 0) from the idle pool
-- [ ] Each transaction includes gas price ceiling check — skip execution if gas exceeds configured max (in gwei)
+- [ ] Bot calls `vault.deallocate(adapter, abi.encode(marketParams), assets)` first for every overweight market (delta < 0) to move assets back into the idle pool
+- [ ] Bot then calls `vault.allocate(adapter, abi.encode(marketParams), assets)` for every underweight market (delta > 0) from the idle pool
+- [ ] Same `adapter` address (the configured `ADAPTER_ADDRESS`) is used for every call — only the encoded `MarketParams` differs per market
+- [ ] Each transaction includes a gas price ceiling check — skip execution if gas exceeds the configured max (in gwei)
 - [ ] Bot uses EIP-1559 gas pricing (`maxFeePerGas` ceiling); viem handles this natively
 - [ ] Bot waits for transaction confirmation before proceeding to the next
 - [ ] If a transaction reverts, bot logs the error, sends Telegram alert, and stops the current rebalance cycle (does not continue with remaining txs)
-- [ ] Successful rebalance logs: adapter addresses, amounts moved, gas used, new allocation percentages
+- [ ] Successful rebalance logs: market labels, amounts moved, gas used, new per-market allocation percentages
 - [ ] When `DRY_RUN=true`, bot logs proposed actions without submitting transactions
 
 **Story B3** — Configurable rebalance trigger
@@ -92,8 +97,8 @@ Acceptance criteria:
 As a vault operator, I want to receive a Telegram message when a rebalance is executed so that I have real-time visibility without watching logs.
 
 Acceptance criteria:
-- [ ] On successful rebalance: message includes vault address, adapters affected, amounts moved (human-readable with token symbol), tx hash(es), new allocation percentages
-- [ ] On failed rebalance: message includes vault address, failing adapter, revert reason (decoded if possible), tx hash
+- [ ] On successful rebalance: message includes vault address, markets affected (by label), amounts moved (human-readable with token symbol), tx hash(es), new per-market allocation percentages
+- [ ] On failed rebalance: message includes vault address, failing market label, revert reason (decoded if possible), tx hash
 - [ ] Telegram bot token and chat ID configured via environment variables
 - [ ] If Telegram API is unreachable, bot logs the alert locally and continues (Telegram failure never blocks rebalancing)
 
@@ -122,7 +127,8 @@ Acceptance criteria:
 As a vault operator, I want a `/api/v1/status` endpoint that shows current vault state so that I can inspect allocations without reading the chain directly.
 
 Acceptance criteria:
-- [ ] Returns current allocation per adapter: adapter address, adapter type, assets (raw + human-readable), percentage of total, cap limits
+- [ ] Returns the configured adapter address
+- [ ] Returns current allocation **per managed market**: market label, MarketParams (loanToken/collateralToken/oracle/lltv), assets (raw + human-readable), percentage of total, the 3 cap ids and their absolute/relative caps
 - [ ] Returns total vault assets
 - [ ] Returns last rebalance timestamp and tx hashes
 - [ ] Returns current gas price vs configured ceiling
@@ -146,7 +152,8 @@ As a vault operator, I want all bot settings in a `.env` file validated at start
 
 Acceptance criteria:
 - [ ] All config validated with zod schema on boot — bot refuses to start with invalid config
-- [ ] Required: `RPC_URL`, `PRIVATE_KEY`, `VAULT_ADDRESS`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+- [ ] Required: `RPC_URL`, `PRIVATE_KEY`, `VAULT_ADDRESS`, `ADAPTER_ADDRESS`, `MANAGED_MARKETS_PATH` (path to a JSON file describing the managed markets), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+- [ ] `MANAGED_MARKETS_PATH` points to a JSON file shaped as `{ markets: [{ label, marketParams: { loanToken, collateralToken, oracle, irm, lltv } }, ...] }` and is validated by a zod schema at startup
 - [ ] Optional with defaults: `CRON_SCHEDULE` (default: `*/5 * * * *`), `DRIFT_THRESHOLD_BPS` (default: 500 = 5%), `GAS_CEILING_GWEI` (default: 50), `MIN_ETH_BALANCE` (default: 0.05), `PORT` (default: 3000), `DRY_RUN` (default: false), `MAX_MARKET_CONCENTRATION_PCT` (default: 10), `MIN_LIQUIDITY_MULTIPLIER` (default: 2)
 - [ ] Sensitive values (`PRIVATE_KEY`, `TELEGRAM_BOT_TOKEN`) are never logged, even at debug level
 - [ ] Bot logs all non-sensitive config values at startup for debugging
@@ -155,30 +162,38 @@ Acceptance criteria:
 
 ### Feature Area: Tutorial — Vault V2 Setup
 
+> **V2 model note** — Vault V2 uses a custom role system (owner → curator → allocator(s) + sentinel(s)), not OpenZeppelin AccessControl. Most curator changes are timelocked, but at fresh deploy the timelocks default to **0**, so the entire setup can be batched into a single curator `multicall(...)` transaction. For the demo, **the deployer is owner _and_ curator**; the bot wallet is the allocator.
+
 **Story F1** — Written guide for Morpho Vault V2 setup
 As a vault operator, I want a step-by-step guide to create a Morpho Vault V2 for USDC with 2-3 Morpho Blue markets so that I can set up the vault my bot will manage.
 
 Acceptance criteria:
 - [ ] Guide is a markdown file at `docs/rebalancing/vault-setup-guide.md`
-- [ ] Covers: prerequisites (ETH for gas, USDC, Foundry installed)
-- [ ] Covers: deploying a Vault V2 via VaultV2Factory with USDC as asset
-- [ ] Covers: deploying 2-3 MorphoMarketV1AdapterV2 adapters for specific USDC markets: USDC/WETH (high liquidity), USDC/wstETH (LST demand), USDC/WBTC (BTC collateral)
-- [ ] Covers: setting caps (absolute and relative) on each adapter
-- [ ] Covers: granting the Allocator role to the bot's wallet address
-- [ ] Covers: verifying the setup via on-chain reads
+- [ ] Covers: prerequisites (ETH for gas, Foundry installed, forge-std submodule)
+- [ ] Covers: role model — owner / curator / allocator / sentinel — and explains why the demo uses deployer = owner = curator
+- [ ] Covers: deploying a Vault V2 via `VaultV2Factory.createVaultV2(owner, USDC, salt)`
+- [ ] Covers: deploying **one** `MorphoMarketV1AdapterV2` via `MorphoMarketV1AdapterV2Factory.createMorphoMarketV1AdapterV2(vault)` (no MarketParams at deploy time — the adapter routes to many markets at runtime)
+- [ ] Covers: owner calls `vault.setCurator(curator)` (not timelocked) so the curator can configure the vault
+- [ ] Covers: curator submits and executes (via `vault.multicall([...])`) the following timelocked operations, all of which run instantly because timelocks default to 0 at fresh deploy:
+  - `submit(addAdapter)` + `addAdapter(adapter)`
+  - For each managed market and each id returned by `adapter.ids(marketParams)`: `submit(increaseAbsoluteCap)` + `increaseAbsoluteCap(idData, cap)` and `submit(increaseRelativeCap)` + `increaseRelativeCap(idData, cap)`
+  - `submit(setIsAllocator)` + `setIsAllocator(botWallet, true)`
+- [ ] Covers: verifying the setup via on-chain reads — `vault.adaptersLength()`, `vault.absoluteCap(id)`, `vault.isAllocator(botWallet)`
+- [ ] Covers: 2-3 USDC markets to manage: USDC/WETH (high liquidity), USDC/wstETH (LST demand), USDC/WBTC (BTC collateral) — these are config for the bot, not separate adapters
 - [ ] All contract addresses reference Ethereum mainnet
 - [ ] Includes a note about testing on a fork first
 
 **Story F2** — Foundry deployment script
-As a vault operator, I want a Foundry script that deploys the vault and adapters on a forked mainnet so that I can test the full setup locally before going live.
+As a vault operator, I want a Foundry script that deploys the vault and adapter on a forked mainnet so that I can test the full setup locally before going live.
 
 Acceptance criteria:
 - [ ] Script lives at `script/DeployVault.s.sol`
-- [ ] Script deploys: VaultV2 (USDC), 2-3 MorphoMarketV1AdapterV2 adapters, sets caps, grants Allocator role
-- [ ] Script uses `vm.envAddress()` / `vm.envUint()` for configurable parameters
+- [ ] Script interfaces match the verified on-chain ABIs (see [PLAN.md § Morpho V2 Contract Interactions](PLAN.md#morpho-v2-contract-interactions))
+- [ ] Script deploys: one VaultV2 (USDC) + one `MorphoMarketV1AdapterV2`, sets curator, and via `vault.multicall(...)` enables the adapter, sets caps for all 3 ids per managed market, and grants the allocator role to the bot wallet — all in a single broadcast batch
+- [ ] Script uses `vm.envAddress()` / `vm.envUint()` for configurable parameters; managed market `MarketParams` are read from env vars or a JSON file via `vm.readFile`
 - [ ] Script can be run against a forked mainnet via `forge script --fork-url`
-- [ ] Script logs all deployed addresses at the end
-- [ ] README in `script/` explains how to run it
+- [ ] Script logs the deployed vault, adapter, and the resulting `MANAGED_MARKETS_PATH` JSON (so the operator can copy it into the bot config)
+- [ ] README in `script/` explains how to run it and documents the curator timelock = 0 assumption
 
 ---
 
@@ -266,3 +281,7 @@ Summary:
 | EIP-1559 or legacy gas pricing? | EIP-1559 — use `maxFeePerGas` ceiling; viem handles this natively | Decided |
 | Zero idle assets scenario? | Deallocate always runs before allocate — handled by execution order | Decided |
 | IRM simulation approach? | Hybrid — read parameters on-chain, compute projections off-chain in TypeScript | Decided |
+| Vault model: N adapters or 1 adapter + N markets? | **One adapter + N managed markets** — matches the Morpho V2 architecture (verified against `morpho-org/vault-v2`). Original spec assumed N adapters which does not exist in V2. | Decided 2026-04-07 |
+| Curator role for the demo deployment? | **Deployer = owner = curator** — single EOA does the entire setup; bot wallet receives only the allocator role (least privilege). | Decided 2026-04-07 |
+| Curator timelock for the demo? | **Leave at the default of 0** at fresh deploy so the script can batch addAdapter / setCaps / setIsAllocator into one `multicall(...)` tx. Production operators can `increaseTimelock` afterwards. | Decided 2026-04-07 |
+| How does the bot discover managed markets? | **Configured at startup** via `MANAGED_MARKETS_PATH` JSON file — explicit list of `MarketParams`. Dynamic discovery deferred to v2. | Decided 2026-04-07 |
