@@ -43,6 +43,25 @@ const envSchema = z.object({
     .regex(/^0x[0-9a-fA-F]{40}$/, { message: "VAULT_ADDRESS must be a valid checksummed Ethereum address" }),
 
   /**
+   * The single MorphoMarketV1AdapterV2 deployed for the configured vault.
+   * All vault.allocate / vault.deallocate calls use this adapter address;
+   * only the ABI-encoded MarketParams in `data` varies per market.
+   */
+  ADAPTER_ADDRESS: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{40}$/, { message: "ADAPTER_ADDRESS must be a valid checksummed Ethereum address" }),
+
+  /**
+   * Absolute path (or path relative to cwd) to a JSON file listing the
+   * Morpho Blue markets the bot should manage.
+   * Shape: { markets: [{ label, marketParams: { loanToken, collateralToken, oracle, irm, lltv } }, ...] }
+   * Validated at startup by loadManagedMarkets() in src/config/managed-markets.ts.
+   */
+  MANAGED_MARKETS_PATH: z
+    .string()
+    .min(1, { message: "MANAGED_MARKETS_PATH must not be empty" }),
+
+  /**
    * Telegram Bot API token.
    * Never logged — redacted in safeConfig().
    */

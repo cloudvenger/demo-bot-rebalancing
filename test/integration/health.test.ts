@@ -28,6 +28,8 @@ const STUB_CONFIG: Config = {
   RPC_URL: "https://mainnet.example.com",
   PRIVATE_KEY: "a".repeat(64),
   VAULT_ADDRESS: "0x1111111111111111111111111111111111111111",
+  ADAPTER_ADDRESS: "0x2222222222222222222222222222222222222222",
+  MANAGED_MARKETS_PATH: "/tmp/managed-markets.json",
   TELEGRAM_BOT_TOKEN: "bot:token",
   TELEGRAM_CHAT_ID: "123456",
   CRON_SCHEDULE: "*/5 * * * *", // 5-minute interval → stale threshold = 10 min

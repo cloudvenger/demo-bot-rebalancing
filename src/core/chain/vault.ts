@@ -1,10 +1,17 @@
 import type { Address, Hash } from "viem";
+import { encodeAbiParameters, keccak256 } from "viem";
 import {
   VAULT_V2_ABI,
   ADAPTER_ABI,
-  CONTRACT_ADDRESSES,
+  MARKET_PARAMS_ABI_COMPONENTS,
+  WAD,
 } from "../../config/constants.js";
-import type { AdapterState, AdapterType, VaultState } from "../rebalancer/types.js";
+import type {
+  ManagedMarket,
+  MarketAllocationState,
+  MarketParams,
+  VaultState,
+} from "../rebalancer/types.js";
 import type { BotPublicClient } from "./client.js";
 
 // ---------------------------------------------------------------------------
@@ -18,7 +25,22 @@ const MAX_RETRIES = 3 as const;
 const BASE_RETRY_DELAY_MS = 500 as const;
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Error types
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown by assertStartupInvariants() when a critical on-chain invariant is
+ * violated at startup.  The bot must not proceed when this is thrown.
+ */
+export class StartupValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StartupValidationError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — retry / sleep
 // ---------------------------------------------------------------------------
 
 /**
@@ -33,8 +55,8 @@ function sleep(ms: number): Promise<void> {
  * Executes `fn` with up to MAX_RETRIES attempts, applying exponential backoff
  * between failures.
  *
- * @param fn  Async function to execute.
- * @param label  Human-readable label used in error messages.
+ * @param fn    Async function to execute.
+ * @param label Human-readable label used in error messages.
  */
 async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
   let lastError: unknown;
@@ -57,46 +79,60 @@ async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Cap-id preimage computation
+// ---------------------------------------------------------------------------
+
 /**
- * Determines the adapter type by checking which known factory address is
- * returned as the adapter's factory (or by falling back to a heuristic).
+ * Computes the 3 cap ids that MorphoMarketV1AdapterV2 derives for a given
+ * (adapter, marketParams) pair.
  *
- * Strategy: attempt to read `factory()` on the adapter and compare to known
- * factory addresses.  If the call reverts or the address is unrecognised, fall
- * back to `"morpho-market-v1"` (the most common type).
+ * These ids are the keccak256 hashes of exact ABI-encoded preimages.  Any
+ * deviation from the preimage the contract uses will produce a different hash
+ * and cause vault.allocate to revert with ZeroAbsoluteCap.
+ *
+ * Verified preimages (PLAN.md § Verified cap-id preimages):
+ *   id[0]: keccak256(abi.encode("this", address(adapter)))
+ *   id[1]: keccak256(abi.encode("collateralToken", marketParams.collateralToken))
+ *   id[2]: keccak256(abi.encode("this/marketParams", address(adapter), marketParams))
+ *
+ * @param adapterAddress  The MorphoMarketV1AdapterV2 contract address.
+ * @param marketParams    The on-chain MarketParams struct for the target market.
+ * @returns Tuple [adapterId, collateralId, marketSpecificId].
  */
-async function resolveAdapterType(
-  publicClient: BotPublicClient,
-  adapterAddress: Address
-): Promise<AdapterType> {
-  try {
-    const factory = await publicClient.readContract({
-      address: adapterAddress,
-      abi: [
-        {
-          name: "factory",
-          type: "function",
-          stateMutability: "view",
-          inputs: [],
-          outputs: [{ name: "", type: "address" }],
-        },
+export function computeMarketCapIds(
+  adapterAddress: Address,
+  marketParams: MarketParams
+): [Hash, Hash, Hash] {
+  // id[0]: adapter-wide — applies to every market the adapter routes to
+  const adapterId = keccak256(
+    encodeAbiParameters(
+      [{ type: "string" }, { type: "address" }],
+      ["this", adapterAddress]
+    )
+  );
+
+  // id[1]: collateral-token — applies to every market sharing the same collateral
+  const collateralId = keccak256(
+    encodeAbiParameters(
+      [{ type: "string" }, { type: "address" }],
+      ["collateralToken", marketParams.collateralToken]
+    )
+  );
+
+  // id[2]: market-specific — applies to exactly one Morpho Blue market
+  const marketSpecificId = keccak256(
+    encodeAbiParameters(
+      [
+        { type: "string" },
+        { type: "address" },
+        { type: "tuple", components: MARKET_PARAMS_ABI_COMPONENTS },
       ],
-      functionName: "factory",
-    });
+      ["this/marketParams", adapterAddress, marketParams]
+    )
+  );
 
-    if (
-      (factory as string).toLowerCase() ===
-      CONTRACT_ADDRESSES.MorphoVaultV1AdapterFactory.toLowerCase()
-    ) {
-      return "morpho-vault-v1";
-    }
-
-    return "morpho-market-v1";
-  } catch {
-    // If the adapter does not expose `factory()` or the call reverts, default
-    // to the market adapter type which is significantly more common.
-    return "morpho-market-v1";
-  }
+  return [adapterId, collateralId, marketSpecificId];
 }
 
 // ---------------------------------------------------------------------------
@@ -106,203 +142,510 @@ async function resolveAdapterType(
 /**
  * Reads state from a Morpho Vault V2 contract.
  *
- * All read methods that touch the chain use multicall where possible to
- * guarantee that all values in a snapshot belong to the same block.
+ * Responsibilities:
+ *   - At startup: assert all on-chain invariants (adapter enabled, allocator
+ *     role, cap-id preimage correctness, relativeCap != 0 for managed markets).
+ *   - Each cycle: multicall a consistent snapshot of totalAssets + per-market
+ *     allocation + all 3 cap values per market.
+ *
+ * Does NOT read Morpho Blue market state or IRM params — that is MorphoReader's
+ * responsibility (interface segregation per CLAUDE.md SOLID principles).
+ *
+ * VaultState.marketData is returned as an empty array; it is populated by
+ * MorphoReader before the state is passed to the strategy engine.
  *
  * Usage:
  * ```ts
- * const reader = new VaultReader(publicClient, vaultAddress);
- * const state  = await reader.readFullState();
+ * const reader = new VaultReader(publicClient, vaultAddress, adapterAddress, managedMarkets);
+ * await reader.assertStartupInvariants(botWallet);
+ * const state = await reader.readFullState();
  * ```
  */
 export class VaultReader {
   private readonly publicClient: BotPublicClient;
   private readonly vaultAddress: Address;
+  private readonly adapterAddress: Address;
 
-  constructor(publicClient: BotPublicClient, vaultAddress: Address) {
+  /**
+   * The working set of managed markets, filtered at startup.  Markets with
+   * absoluteCap == 0 on any of their 3 ids are excluded from this array after
+   * assertStartupInvariants() runs.  readFullState() only reads these markets.
+   */
+  private activeManagedMarkets: ManagedMarket[];
+
+  /**
+   * @param publicClient    viem public client (mainnet, with retry transport).
+   * @param vaultAddress    Vault V2 contract address (from VAULT_ADDRESS env var).
+   * @param adapterAddress  Single MorphoMarketV1AdapterV2 address (from ADAPTER_ADDRESS).
+   * @param managedMarkets  Markets loaded from MANAGED_MARKETS_PATH JSON file.
+   *                        capIds arrays will be mutated in-place during
+   *                        assertStartupInvariants().
+   */
+  constructor(
+    publicClient: BotPublicClient,
+    vaultAddress: Address,
+    adapterAddress: Address,
+    managedMarkets: ManagedMarket[]
+  ) {
     this.publicClient = publicClient;
     this.vaultAddress = vaultAddress;
+    this.adapterAddress = adapterAddress;
+    // Start with all markets; assertStartupInvariants filters inactive ones.
+    this.activeManagedMarkets = managedMarkets;
   }
 
   // -------------------------------------------------------------------------
-  // Public read methods
+  // Startup invariants
   // -------------------------------------------------------------------------
 
   /**
-   * Reads the total assets currently under management in the vault.
+   * Validates all on-chain invariants required for safe bot operation.
+   * Must be called once at startup, before the first rebalance cycle.
    *
-   * @returns Total assets as a bigint (vault's underlying asset native decimals).
+   * Steps (in order):
+   *   1. Assert ADAPTER_ADDRESS is listed in vault.adapters(0..n).
+   *   2. Assert adapter.parentVault() == vaultAddress.
+   *   3. Assert vault.isAllocator(botWallet) == true.
+   *   4. For each managed market: compute 3 cap ids locally and assert they
+   *      match adapter.ids(marketParams) exactly (preimage correctness check).
+   *      Mutates market.capIds in-place with the on-chain values.
+   *   5. For each managed market: refuse to start if any relativeCap == 0n.
+   *   6. Markets with absoluteCap == 0 on any id are logged and excluded from
+   *      the active market set (not a fatal error — just not allocatable).
+   *
+   * @param botWallet  The bot wallet address (used to check the allocator role).
+   * @throws {StartupValidationError} on any failed invariant.
    */
-  async readTotalAssets(): Promise<bigint> {
-    return withRetry(
-      () =>
-        this.publicClient.readContract({
-          address: this.vaultAddress,
-          abi: VAULT_V2_ABI,
-          functionName: "totalAssets",
-        }),
-      "VaultReader.readTotalAssets"
-    );
+  async assertStartupInvariants(botWallet: Address): Promise<void> {
+    // ---- Step 1: verify adapter is enabled on the vault --------------------
+    await this._assertAdapterEnabled();
+
+    // ---- Step 2: verify adapter.parentVault() == vaultAddress -------------
+    await this._assertAdapterParentVault();
+
+    // ---- Step 3: verify botWallet has the allocator role -------------------
+    await this._assertAllocatorRole(botWallet);
+
+    // ---- Steps 4, 5, 6: per-market validation ------------------------------
+    const activeMarkets: ManagedMarket[] = [];
+
+    for (const market of this.activeManagedMarkets) {
+      const excluded = await this._validateMarketAndPopulateCapIds(market);
+      if (!excluded) {
+        activeMarkets.push(market);
+      }
+    }
+
+    // Replace the full market list with only the allocatable subset.
+    this.activeManagedMarkets = activeMarkets;
   }
 
-  /**
-   * Reads the absolute and relative caps for a given risk ID.
-   *
-   * @param riskId  Bytes32 risk identifier (typically the adapter address or
-   *                a market ID used as the cap key).
-   */
-  async readCaps(
-    riskId: Hash
-  ): Promise<{ absoluteCap: bigint; relativeCap: number }> {
-    const result = await withRetry(
-      () =>
-        this.publicClient.readContract({
-          address: this.vaultAddress,
-          abi: VAULT_V2_ABI,
-          functionName: "caps",
-          args: [riskId],
-        }),
-      `VaultReader.readCaps(${riskId})`
-    );
-
-    const [absoluteCap, relativeCap] = result as [bigint, bigint];
-
-    return {
-      absoluteCap,
-      // relativeCap is stored on-chain as a uint256 (basis points).
-      relativeCap: Number(relativeCap),
-    };
-  }
+  // -------------------------------------------------------------------------
+  // Full state read (called each cycle)
+  // -------------------------------------------------------------------------
 
   /**
-   * Discovers all enabled adapters on the vault and reads their on-chain state
-   * in batched multicall calls.
+   * Reads the complete vault state in a single consistent multicall snapshot.
    *
-   * Steps:
-   * 1. Read `adaptersLength()` to know how many adapters exist.
-   * 2. Multicall `adaptersAt(i)` for each index — single block snapshot.
-   * 3. Multicall `realAssets()` across all adapters — same block snapshot.
-   * 4. Resolve adapter types (heuristic — one extra call per adapter).
-   * 5. Read caps per adapter.
-   * 6. Compute `allocationPercentage` from totalAssets.
+   * Multicall structure:
+   *   - vault.totalAssets()
+   *   - For each active market:
+   *       vault.allocation(marketSpecificId)   (id[2])
+   *       vault.absoluteCap(id[0..2]) × 3
+   *       vault.relativeCap(id[0..2]) × 3
+   *   Total calls: 1 + (N × 7)
    *
-   * @param totalAssets  Pre-fetched total assets (avoids a redundant call).
-   *                     Pass `0n` to compute allocation percentages as 0.
+   * All reads use allowFailure: false so any single RPC error fails the entire
+   * snapshot (partial state is worse than no state for a rebalancing bot).
+   *
+   * @returns VaultState with marketData: [] — MorphoReader fills that field.
    */
-  async readAdapters(totalAssets: bigint): Promise<AdapterState[]> {
+  async readFullState(): Promise<VaultState> {
     return withRetry(async () => {
-      // ------------------------------------------------------------------
-      // Step 1: how many adapters?
-      // ------------------------------------------------------------------
-      const adaptersLength = await this.publicClient.readContract({
+      const markets = this.activeManagedMarkets;
+
+      // ---- Build multicall contracts list ----------------------------------
+      type ContractCall = {
+        address: Address;
+        abi: typeof VAULT_V2_ABI;
+        functionName: string;
+        args?: readonly unknown[];
+      };
+
+      const calls: ContractCall[] = [];
+
+      // [0]: totalAssets
+      calls.push({
         address: this.vaultAddress,
         abi: VAULT_V2_ABI,
-        functionName: "adaptersLength",
+        functionName: "totalAssets",
       });
 
-      const count = Number(adaptersLength);
+      // [1 + i*7 + 0]: allocation(marketSpecificId)
+      // [1 + i*7 + 1]: absoluteCap(id[0])
+      // [1 + i*7 + 2]: absoluteCap(id[1])
+      // [1 + i*7 + 3]: absoluteCap(id[2])
+      // [1 + i*7 + 4]: relativeCap(id[0])
+      // [1 + i*7 + 5]: relativeCap(id[1])
+      // [1 + i*7 + 6]: relativeCap(id[2])
+      for (const market of markets) {
+        const [id0, id1, id2] = market.capIds as [Hash, Hash, Hash];
 
-      if (count === 0) {
-        return [];
+        calls.push({
+          address: this.vaultAddress,
+          abi: VAULT_V2_ABI,
+          functionName: "allocation",
+          args: [id2] as const,
+        });
+
+        for (const id of [id0, id1, id2]) {
+          calls.push({
+            address: this.vaultAddress,
+            abi: VAULT_V2_ABI,
+            functionName: "absoluteCap",
+            args: [id] as const,
+          });
+        }
+
+        for (const id of [id0, id1, id2]) {
+          calls.push({
+            address: this.vaultAddress,
+            abi: VAULT_V2_ABI,
+            functionName: "relativeCap",
+            args: [id] as const,
+          });
+        }
       }
 
-      // ------------------------------------------------------------------
-      // Step 2: enumerate adapter addresses via multicall
-      // ------------------------------------------------------------------
-      const adapterIndexCalls = Array.from({ length: count }, (_, i) => ({
-        address: this.vaultAddress,
-        abi: VAULT_V2_ABI,
-        functionName: "adaptersAt" as const,
-        args: [BigInt(i)] as const,
-      }));
-
-      const adapterAddressResults = await this.publicClient.multicall({
-        contracts: adapterIndexCalls,
+      // ---- Execute multicall -----------------------------------------------
+      const results = await this.publicClient.multicall({
+        contracts: calls as Parameters<typeof this.publicClient.multicall>[0]["contracts"],
         allowFailure: false,
       });
 
-      const adapterAddresses = adapterAddressResults as Address[];
+      // ---- Parse results ---------------------------------------------------
+      const totalAssets = results[0] as bigint;
 
-      // ------------------------------------------------------------------
-      // Step 3: read realAssets() for all adapters via multicall
-      // ------------------------------------------------------------------
-      const realAssetsCalls = adapterAddresses.map((addr) => ({
-        address: addr,
-        abi: ADAPTER_ABI,
-        functionName: "realAssets" as const,
-      }));
+      const marketStates: MarketAllocationState[] = markets.map((market, i) => {
+        const base = 1 + i * 7;
 
-      const realAssetsResults = await this.publicClient.multicall({
-        contracts: realAssetsCalls,
-        allowFailure: false,
-      });
+        const allocation = results[base] as bigint;
+        const absId0 = results[base + 1] as bigint;
+        const absId1 = results[base + 2] as bigint;
+        const absId2 = results[base + 3] as bigint;
+        const relId0 = results[base + 4] as bigint;
+        const relId1 = results[base + 5] as bigint;
+        const relId2 = results[base + 6] as bigint;
 
-      const realAssetsValues = realAssetsResults as bigint[];
-
-      // ------------------------------------------------------------------
-      // Step 4: resolve adapter types (sequential — one call per adapter)
-      // ------------------------------------------------------------------
-      const adapterTypes = await Promise.all(
-        adapterAddresses.map((addr) => resolveAdapterType(this.publicClient, addr))
-      );
-
-      // ------------------------------------------------------------------
-      // Step 5: read caps per adapter (adapter address used as risk ID)
-      // ------------------------------------------------------------------
-      const capsCalls = adapterAddresses.map((addr) => ({
-        address: this.vaultAddress,
-        abi: VAULT_V2_ABI,
-        functionName: "caps" as const,
-        args: [addr as Hash] as const,
-      }));
-
-      const capsResults = await this.publicClient.multicall({
-        contracts: capsCalls,
-        allowFailure: false,
-      });
-
-      // ------------------------------------------------------------------
-      // Step 6: build AdapterState objects
-      // ------------------------------------------------------------------
-      return adapterAddresses.map((address, i) => {
-        const realAssets = realAssetsValues[i];
-        const [absoluteCap, relativeCap] = capsResults[i] as [bigint, bigint];
+        const [id0, id1, id2] = market.capIds as [Hash, Hash, Hash];
 
         const allocationPercentage =
           totalAssets > 0n
-            ? Number(realAssets * 10_000n / totalAssets) / 10_000
+            ? Number((allocation * 10_000n) / totalAssets) / 10_000
             : 0;
 
         return {
-          address,
-          adapterType: adapterTypes[i],
-          realAssets,
+          market,
+          allocation,
           allocationPercentage,
-          absoluteCap,
-          relativeCap: Number(relativeCap),
-        } satisfies AdapterState;
+          caps: [
+            { id: id0, absoluteCap: absId0, relativeCap: relId0 },
+            { id: id1, absoluteCap: absId1, relativeCap: relId1 },
+            { id: id2, absoluteCap: absId2, relativeCap: relId2 },
+          ],
+        } satisfies MarketAllocationState;
       });
-    }, "VaultReader.readAdapters");
+
+      return {
+        vaultAddress: this.vaultAddress,
+        adapterAddress: this.adapterAddress,
+        totalAssets,
+        marketStates,
+        // marketData is populated by MorphoReader — VaultReader does not own it.
+        marketData: [],
+      } satisfies VaultState;
+    }, "VaultReader.readFullState");
+  }
+
+  // -------------------------------------------------------------------------
+  // Private startup helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Enumerates vault.adapters(0..adaptersLength()) and asserts the configured
+   * adapterAddress is present.
+   */
+  private async _assertAdapterEnabled(): Promise<void> {
+    const adaptersLength = await withRetry(
+      () =>
+        this.publicClient.readContract({
+          address: this.vaultAddress,
+          abi: VAULT_V2_ABI,
+          functionName: "adaptersLength",
+        }),
+      "VaultReader._assertAdapterEnabled: adaptersLength"
+    );
+
+    const count = Number(adaptersLength);
+
+    if (count === 0) {
+      throw new StartupValidationError(
+        `Refusing to start: vault ${this.vaultAddress} has no enabled adapters. ` +
+          `Expected adapter ${this.adapterAddress} to be present.`
+      );
+    }
+
+    // Multicall adapters(0..n-1) for a consistent snapshot.
+    const indexCalls = Array.from({ length: count }, (_, i) => ({
+      address: this.vaultAddress,
+      abi: VAULT_V2_ABI,
+      functionName: "adapters" as const,
+      args: [BigInt(i)] as const,
+    }));
+
+    const adapterAddresses = (await this.publicClient.multicall({
+      contracts: indexCalls,
+      allowFailure: false,
+    })) as Address[];
+
+    const normalizedTarget = this.adapterAddress.toLowerCase();
+    const found = adapterAddresses.some(
+      (addr) => addr.toLowerCase() === normalizedTarget
+    );
+
+    if (!found) {
+      throw new StartupValidationError(
+        `Refusing to start: configured ADAPTER_ADDRESS ${this.adapterAddress} ` +
+          `is not enabled on vault ${this.vaultAddress}. ` +
+          `Enabled adapters: [${adapterAddresses.join(", ")}].`
+      );
+    }
   }
 
   /**
-   * Reads the complete vault state in a single consistent snapshot.
-   *
-   * Calls `totalAssets()` first (single call), then multicalls everything else
-   * to minimise block-boundary drift between reads.
-   *
-   * @returns VaultState — ready to be passed to the strategy engine.
+   * Reads adapter.parentVault() and asserts it equals the configured vaultAddress.
    */
-  async readFullState(): Promise<VaultState> {
-    const totalAssets = await this.readTotalAssets();
-    const adapters = await this.readAdapters(totalAssets);
+  private async _assertAdapterParentVault(): Promise<void> {
+    const parentVault = await withRetry(
+      () =>
+        this.publicClient.readContract({
+          address: this.adapterAddress,
+          abi: ADAPTER_ABI,
+          functionName: "parentVault",
+        }),
+      "VaultReader._assertAdapterParentVault"
+    );
 
-    return {
-      vaultAddress: this.vaultAddress,
-      totalAssets,
-      adapters,
-      // markets is populated by MorphoReader — VaultReader owns only vault state.
-      markets: [],
-    };
+    if ((parentVault as string).toLowerCase() !== this.vaultAddress.toLowerCase()) {
+      throw new StartupValidationError(
+        `Refusing to start: adapter ${this.adapterAddress} has parentVault = ` +
+          `${parentVault}, but configured VAULT_ADDRESS is ${this.vaultAddress}. ` +
+          `The adapter does not belong to the configured vault.`
+      );
+    }
+  }
+
+  /**
+   * Reads vault.isAllocator(botWallet) and asserts it is true.
+   */
+  private async _assertAllocatorRole(botWallet: Address): Promise<void> {
+    const isAllocator = await withRetry(
+      () =>
+        this.publicClient.readContract({
+          address: this.vaultAddress,
+          abi: VAULT_V2_ABI,
+          functionName: "isAllocator",
+          args: [botWallet],
+        }),
+      "VaultReader._assertAllocatorRole"
+    );
+
+    if (!isAllocator) {
+      throw new StartupValidationError(
+        `Refusing to start: bot wallet ${botWallet} does not have the allocator ` +
+          `role on vault ${this.vaultAddress}. ` +
+          `The curator must call vault.setIsAllocator(botWallet, true) before ` +
+          `the bot can submit transactions.`
+      );
+    }
+  }
+
+  /**
+   * For a single managed market:
+   *   1. Computes the 3 cap ids locally and reads adapter.ids(marketParams).
+   *   2. Asserts locally computed ids match on-chain ids exactly.
+   *   3. Mutates market.capIds in-place with the verified on-chain ids.
+   *   4. Reads relativeCap for all 3 ids and refuses to start if any == 0n.
+   *   5. Reads absoluteCap for all 3 ids; if any == 0n, logs and returns true
+   *      (excluded from active markets).
+   *
+   * @returns true if the market should be excluded from the rebalance loop,
+   *          false if it is allocatable.
+   */
+  private async _validateMarketAndPopulateCapIds(
+    market: ManagedMarket
+  ): Promise<boolean> {
+    const { label, marketParams } = market;
+
+    // ---- Step 4a: compute ids locally --------------------------------------
+    const [localId0, localId1, localId2] = computeMarketCapIds(
+      this.adapterAddress,
+      marketParams
+    );
+
+    // ---- Step 4b: read adapter.ids(marketParams) ----------------------------
+    const onChainIds = await withRetry(
+      () =>
+        this.publicClient.readContract({
+          address: this.adapterAddress,
+          abi: ADAPTER_ABI,
+          functionName: "ids",
+          args: [marketParams],
+        }),
+      `VaultReader._validateMarketAndPopulateCapIds: adapter.ids(${label})`
+    );
+
+    const [onChainId0, onChainId1, onChainId2] = onChainIds as [Hash, Hash, Hash];
+
+    // ---- Step 4c: assert preimage correctness -------------------------------
+    if (localId0 !== onChainId0) {
+      throw new StartupValidationError(
+        `Refusing to start: cap id[0] (adapter-wide) mismatch for market "${label}". ` +
+          `Locally computed: ${localId0}, on-chain from adapter.ids(): ${onChainId0}. ` +
+          `ABI encoding for "this/adapter" preimage is incorrect — ` +
+          `fix computeMarketCapIds() before proceeding.`
+      );
+    }
+
+    if (localId1 !== onChainId1) {
+      throw new StartupValidationError(
+        `Refusing to start: cap id[1] (collateral-token) mismatch for market "${label}". ` +
+          `Locally computed: ${localId1}, on-chain from adapter.ids(): ${onChainId1}. ` +
+          `ABI encoding for "collateralToken" preimage is incorrect — ` +
+          `fix computeMarketCapIds() before proceeding.`
+      );
+    }
+
+    if (localId2 !== onChainId2) {
+      throw new StartupValidationError(
+        `Refusing to start: cap id[2] (market-specific) mismatch for market "${label}". ` +
+          `Locally computed: ${localId2}, on-chain from adapter.ids(): ${onChainId2}. ` +
+          `ABI encoding for "this/marketParams" preimage is incorrect — ` +
+          `fix computeMarketCapIds() before proceeding.`
+      );
+    }
+
+    // ---- Step 4d: populate capIds in-place (source of truth = on-chain) ----
+    market.capIds = [onChainId0, onChainId1, onChainId2];
+
+    // ---- Steps 5 & 6: read relativeCap and absoluteCap for all 3 ids --------
+    const capReads = await withRetry(
+      () =>
+        this.publicClient.multicall({
+          contracts: [
+            {
+              address: this.vaultAddress,
+              abi: VAULT_V2_ABI,
+              functionName: "relativeCap" as const,
+              args: [onChainId0] as const,
+            },
+            {
+              address: this.vaultAddress,
+              abi: VAULT_V2_ABI,
+              functionName: "relativeCap" as const,
+              args: [onChainId1] as const,
+            },
+            {
+              address: this.vaultAddress,
+              abi: VAULT_V2_ABI,
+              functionName: "relativeCap" as const,
+              args: [onChainId2] as const,
+            },
+            {
+              address: this.vaultAddress,
+              abi: VAULT_V2_ABI,
+              functionName: "absoluteCap" as const,
+              args: [onChainId0] as const,
+            },
+            {
+              address: this.vaultAddress,
+              abi: VAULT_V2_ABI,
+              functionName: "absoluteCap" as const,
+              args: [onChainId1] as const,
+            },
+            {
+              address: this.vaultAddress,
+              abi: VAULT_V2_ABI,
+              functionName: "absoluteCap" as const,
+              args: [onChainId2] as const,
+            },
+          ],
+          allowFailure: false,
+        }),
+      `VaultReader._validateMarketAndPopulateCapIds: caps(${label})`
+    );
+
+    const [rel0, rel1, rel2, abs0, abs1, abs2] = capReads as [
+      bigint,
+      bigint,
+      bigint,
+      bigint,
+      bigint,
+      bigint,
+    ];
+
+    const capIds: [Hash, Hash, Hash] = [onChainId0, onChainId1, onChainId2];
+    const relativeCaps: [bigint, bigint, bigint] = [rel0, rel1, rel2];
+    const absoluteCaps: [bigint, bigint, bigint] = [abs0, abs1, abs2];
+
+    // ---- Step 5: refuse to start if any relativeCap == 0n ------------------
+    // relativeCap == 0 means "allocation must be 0", effectively forbidding
+    // the market. The intended "no relative cap" sentinel is WAD (1e18).
+    for (let k = 0; k < 3; k++) {
+      if (relativeCaps[k] === 0n) {
+        throw new StartupValidationError(
+          `Refusing to start: market ${label} has relativeCap == 0 on cap id ${capIds[k]}. ` +
+            `This forbids any allocation to this market. ` +
+            `If you meant 'no relative cap', set relativeCap to WAD (1e18). ` +
+            `If you meant to forbid this market, remove it from MANAGED_MARKETS.`
+        );
+      }
+    }
+
+    // ---- Step 6: exclude markets where ANY absoluteCap == 0n ---------------
+    // absoluteCap == 0 means vault.allocate will revert with ZeroAbsoluteCap.
+    // This is logged as informational (not an error — operator just hasn't set
+    // the cap yet) and the market is excluded from the active set.
+    for (let k = 0; k < 3; k++) {
+      if (absoluteCaps[k] === 0n) {
+        // Using console.warn here intentionally — this is a startup diagnostic,
+        // not a structured log. Callers (e.g. RebalanceService) will wrap this
+        // in structured Pino logging once a logger is available.
+        console.warn(
+          `[VaultReader] ignored: no absolute cap configured on cap id ${capIds[k]} ` +
+            `for market "${label}". ` +
+            `This market will be excluded from the rebalance loop until a curator ` +
+            `calls vault.increaseAbsoluteCap(idData, cap) for this id.`
+        );
+        return true; // excluded
+      }
+    }
+
+    // Market passed all checks — include in the active set.
+    return false;
+  }
+
+  // -------------------------------------------------------------------------
+  // Accessor
+  // -------------------------------------------------------------------------
+
+  /**
+   * Returns the list of markets that passed startup validation and are eligible
+   * for allocation reads and rebalancing.
+   *
+   * Available after assertStartupInvariants() completes.
+   */
+  get activeMarkets(): readonly ManagedMarket[] {
+    return this.activeManagedMarkets;
   }
 }

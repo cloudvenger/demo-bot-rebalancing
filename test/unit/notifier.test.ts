@@ -1,6 +1,11 @@
 /**
  * Unit tests for src/services/notifier.ts — Notifier class
  *
+ * Updated for V2 single-adapter model (Group 8.3):
+ *   - RebalanceAction now includes `marketLabel` field
+ *   - Notifier templates use `action.marketLabel` (human-readable) instead of adapter address
+ *   - RebalanceResult.newAllocations uses { marketLabel, percentage }
+ *
  * Strategy: mock global `fetch` using vi.stubGlobal so no real network calls
  * are made. Each test restores or resets the stub as needed to remain
  * fully independent.
@@ -22,7 +27,7 @@ import type { RebalanceResult, RebalanceAction } from "../../src/core/rebalancer
 // ---------------------------------------------------------------------------
 
 const VAULT_ADDRESS: Address = "0x1111111111111111111111111111111111111111";
-const ADAPTER_A: Address = "0x2222222222222222222222222222222222222222";
+const ADAPTER_ADDRESS: Address = "0x2222222222222222222222222222222222222222";
 
 const TX_HASH_1 = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as const;
 
@@ -42,14 +47,15 @@ function makeSuccessResult(overrides?: Partial<RebalanceResult>): RebalanceResul
   return {
     actions: [
       {
-        adapter: ADAPTER_A,
+        adapter: ADAPTER_ADDRESS,
+        marketLabel: "USDC/WETH 86%",
         direction: "allocate",
         amount: 1_000_500_000n, // 1000.50 USDC
-        data: "0x",
+        data: "0x1234",
       },
     ],
     txHashes: [TX_HASH_1],
-    newAllocations: [{ adapter: ADAPTER_A, percentage: 100 }],
+    newAllocations: [{ marketLabel: "USDC/WETH 86%", percentage: 100 }],
     timestamp: "2026-04-06T12:00:00.000Z",
     ...overrides,
   };
@@ -57,10 +63,11 @@ function makeSuccessResult(overrides?: Partial<RebalanceResult>): RebalanceResul
 
 function makeDeallocateAction(): RebalanceAction {
   return {
-    adapter: ADAPTER_A,
+    adapter: ADAPTER_ADDRESS,
+    marketLabel: "USDC/wstETH 86%",
     direction: "deallocate",
     amount: 500_000_000n, // 500 USDC
-    data: "0x",
+    data: "0x5678",
   };
 }
 
@@ -135,14 +142,25 @@ describe("Notifier.notifyRebalanceSuccess", () => {
     expect(body.text).toContain(TX_HASH_1);
   });
 
-  it("includes the adapter address in the message body for actions", async () => {
+  it("includes the marketLabel in the message body for actions (not adapter address)", async () => {
     const notifier = new Notifier(makeConfig(), 0);
 
     await notifier.notifyRebalanceSuccess(makeSuccessResult(), VAULT_ADDRESS);
 
     const [, options] = fetchSpy.mock.calls[0];
     const body = JSON.parse((options as RequestInit).body as string);
-    expect(body.text).toContain(ADAPTER_A);
+    // New V2 shape: marketLabel is used, not adapter address
+    expect(body.text).toContain("USDC/WETH 86%");
+  });
+
+  it("includes the newAllocation marketLabel in the message body", async () => {
+    const notifier = new Notifier(makeConfig(), 0);
+
+    await notifier.notifyRebalanceSuccess(makeSuccessResult(), VAULT_ADDRESS);
+
+    const [, options] = fetchSpy.mock.calls[0];
+    const body = JSON.parse((options as RequestInit).body as string);
+    expect(body.text).toContain("USDC/WETH 86%");
   });
 
   it("sends with the configured chat_id", async () => {
@@ -193,7 +211,7 @@ describe("Notifier.notifyRebalanceFailed", () => {
     expect(body.text).toContain("execution reverted");
   });
 
-  it("includes the failing adapter address when a failedAction is provided", async () => {
+  it("includes the failing marketLabel when a failedAction is provided", async () => {
     const notifier = new Notifier(makeConfig(), 0);
 
     await notifier.notifyRebalanceFailed(
@@ -204,7 +222,8 @@ describe("Notifier.notifyRebalanceFailed", () => {
 
     const [, options] = fetchSpy.mock.calls[0];
     const body = JSON.parse((options as RequestInit).body as string);
-    expect(body.text).toContain(ADAPTER_A);
+    // New V2 shape: message uses marketLabel, not adapter address
+    expect(body.text).toContain("USDC/wstETH 86%");
   });
 
   it("calls fetch once for a failure alert", async () => {
@@ -296,12 +315,8 @@ describe("Notifier — cooldown suppression", () => {
     const cooldownMs = 15 * 60 * 1000;
     const notifier = new Notifier(makeConfig(), cooldownMs);
 
-    // First send — should go through
     await notifier.notifyHealthIssue("rpc_failure", "first");
-    // Advance time by 1 minute — still within cooldown
-    vi.setSystemTime(now + 60_000);
-
-    // Second send — should be suppressed
+    vi.setSystemTime(now + 60_000); // 1 minute later — still in cooldown
     await notifier.notifyHealthIssue("rpc_failure", "second");
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
@@ -317,7 +332,6 @@ describe("Notifier — cooldown suppression", () => {
 
     const notifier = new Notifier(makeConfig(), 15 * 60 * 1000);
     await notifier.notifyHealthIssue("low_balance", "first");
-
     vi.setSystemTime(now + 30_000);
 
     await expect(
@@ -347,12 +361,8 @@ describe("Notifier — cooldown expiry", () => {
     const cooldownMs = 15 * 60 * 1000;
     const notifier = new Notifier(makeConfig(), cooldownMs);
 
-    // First send
     await notifier.notifyHealthIssue("missed_heartbeat", "first");
-    // Advance time past cooldown
-    vi.setSystemTime(now + cooldownMs + 1);
-
-    // Second send — cooldown expired, should go through
+    vi.setSystemTime(now + cooldownMs + 1); // past the cooldown
     await notifier.notifyHealthIssue("missed_heartbeat", "second");
 
     expect(fetchSpy).toHaveBeenCalledTimes(2);
@@ -366,7 +376,7 @@ describe("Notifier — cooldown expiry", () => {
     const fetchSpy = vi.fn().mockResolvedValue(makeOkFetchResponse());
     vi.stubGlobal("fetch", fetchSpy);
 
-    const cooldownMs = 60_000; // 1 minute for this test
+    const cooldownMs = 60_000;
     const notifier = new Notifier(makeConfig(), cooldownMs);
 
     await notifier.notifyHealthIssue("rpc_failure", "first");
@@ -397,9 +407,7 @@ describe("Notifier — cooldown per alert type independence", () => {
 
     const notifier = new Notifier(makeConfig(), 15 * 60 * 1000);
 
-    // Send rpc_failure — starts cooldown for rpc_failure
     await notifier.notifyHealthIssue("rpc_failure", "rpc error");
-    // Send missed_heartbeat — different type, should not be suppressed
     await notifier.notifyHealthIssue("missed_heartbeat", "heartbeat missed");
 
     expect(fetchSpy).toHaveBeenCalledTimes(2);
@@ -416,9 +424,7 @@ describe("Notifier — cooldown per alert type independence", () => {
     const cooldownMs = 15 * 60 * 1000;
     const notifier = new Notifier(makeConfig(), cooldownMs);
 
-    // Trigger rebalance_failed cooldown
     await notifier.notifyRebalanceFailed(new Error("err"), VAULT_ADDRESS);
-    // rpc_failure should still go through
     await notifier.notifyHealthIssue("rpc_failure", "rpc down");
 
     expect(fetchSpy).toHaveBeenCalledTimes(2);
@@ -473,7 +479,6 @@ describe("Notifier — Telegram fetch rejection isolation", () => {
     const now = Date.now();
     vi.setSystemTime(now);
 
-    // First call fails, second call succeeds
     const fetchSpy = vi
       .fn()
       .mockRejectedValueOnce(new Error("ECONNREFUSED"))
@@ -483,13 +488,8 @@ describe("Notifier — Telegram fetch rejection isolation", () => {
     const cooldownMs = 15 * 60 * 1000;
     const notifier = new Notifier(makeConfig(), cooldownMs);
 
-    // Failed send — lastSentAt should NOT be set
     await notifier.notifyHealthIssue("rpc_failure", "first attempt");
-
-    // Advance time — still within what would be cooldown IF it had been set
     vi.setSystemTime(now + 60_000);
-
-    // Should still go through because the failed send didn't start the cooldown
     await notifier.notifyHealthIssue("rpc_failure", "second attempt");
 
     expect(fetchSpy).toHaveBeenCalledTimes(2);
@@ -533,7 +533,6 @@ describe("Notifier — Telegram non-2xx response", () => {
     const now = Date.now();
     vi.setSystemTime(now);
 
-    // First call returns 500, second returns 200
     const fetchSpy = vi
       .fn()
       .mockResolvedValueOnce(makeErrorFetchResponse(500))
@@ -543,13 +542,8 @@ describe("Notifier — Telegram non-2xx response", () => {
     const cooldownMs = 15 * 60 * 1000;
     const notifier = new Notifier(makeConfig(), cooldownMs);
 
-    // First attempt — 500 response, cooldown should NOT be started
     await notifier.notifyHealthIssue("rpc_failure", "first");
-
-    // Advance 1 minute — within what would be cooldown if first had succeeded
     vi.setSystemTime(now + 60_000);
-
-    // Second attempt — should go through since first failed
     await notifier.notifyHealthIssue("rpc_failure", "second");
 
     expect(fetchSpy).toHaveBeenCalledTimes(2);
@@ -574,10 +568,11 @@ describe("Notifier — USDC amount formatting", () => {
     const result = makeSuccessResult({
       actions: [
         {
-          adapter: ADAPTER_A,
+          adapter: ADAPTER_ADDRESS,
+          marketLabel: "USDC/WETH 86%",
           direction: "allocate",
           amount: 1_000_500_000n, // 1000.50 USDC (6 decimals)
-          data: "0x",
+          data: "0x1234",
         },
       ],
     });
@@ -586,7 +581,6 @@ describe("Notifier — USDC amount formatting", () => {
 
     const [, options] = fetchSpy.mock.calls[0];
     const body = JSON.parse((options as RequestInit).body as string);
-    // 1_000_500_000 / 1e6 = 1000.50 → formatted as "1000.50"
     expect(body.text).toContain("1000.50");
   });
 
@@ -600,10 +594,11 @@ describe("Notifier — USDC amount formatting", () => {
       new Error("revert"),
       VAULT_ADDRESS,
       {
-        adapter: ADAPTER_A,
+        adapter: ADAPTER_ADDRESS,
+        marketLabel: "USDC/wstETH 86%",
         direction: "deallocate",
         amount: 500_000_000n, // 500.00 USDC
-        data: "0x",
+        data: "0x5678",
       }
     );
 
@@ -620,10 +615,11 @@ describe("Notifier — USDC amount formatting", () => {
     const result = makeSuccessResult({
       actions: [
         {
-          adapter: ADAPTER_A,
+          adapter: ADAPTER_ADDRESS,
+          marketLabel: "USDC/WETH 86%",
           direction: "allocate",
           amount: 1_000_000n, // 1.00 USDC
-          data: "0x",
+          data: "0x1234",
         },
       ],
     });
@@ -682,7 +678,6 @@ describe("Notifier — error message sanitization", () => {
     vi.stubGlobal("fetch", fetchSpy);
 
     const notifier = new Notifier(makeConfig(), 0);
-    // A 64-character hex string — could be a private key fragment
     const longHex = "0x" + "a".repeat(64);
     const errorWithHex = new Error(`Signing error with key ${longHex}`);
 

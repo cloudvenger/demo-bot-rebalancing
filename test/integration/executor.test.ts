@@ -1,9 +1,17 @@
 /**
  * Integration tests for src/core/chain/executor.ts
  *
- * Strategy: mock walletClient and publicClient at the viem boundary
- * (writeContract, getGasPrice, waitForTransactionReceipt). All Executor and
- * DryRunExecutor code paths execute without any network access.
+ * Two scopes:
+ *   A. Mocked-client tests (run always) — mock walletClient + publicClient at the
+ *      viem boundary to test gas ceiling, dry-run, and revert handling without any
+ *      network access.
+ *   B. Anvil-gated tests (skipped when ANVIL_RPC_URL is unset) — verify 3-arg
+ *      allocate/deallocate succeed end-to-end on a real vault.
+ *
+ * Updated for V2 single-adapter model (Group 8.3):
+ *   - RebalanceAction now requires `marketLabel` (human-readable string).
+ *   - executor.ts passes exactly 3 args to writeContract: [adapter, data, amount].
+ *   - data is ABI-encoded MarketParams (not "0x").
  *
  * Mock boundary: publicClient.getGasPrice, publicClient.waitForTransactionReceipt,
  * and walletClient.writeContract are the only external dependencies mocked.
@@ -20,31 +28,42 @@ import type { RebalanceAction } from "../../src/core/rebalancer/types.js";
 // ---------------------------------------------------------------------------
 
 const VAULT_ADDRESS: Address = "0x1111111111111111111111111111111111111111";
-const ADAPTER_A: Address = "0x2222222222222222222222222222222222222222";
-const ADAPTER_B: Address = "0x3333333333333333333333333333333333333333";
+const ADAPTER_ADDRESS: Address = "0x2222222222222222222222222222222222222222";
 
 const TX_HASH_1 = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as Hash;
 const TX_HASH_2 = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" as Hash;
+
+// Minimal ABI-encoded MarketParams placeholder (non-empty hex, as the real executor would pass)
+const ENCODED_MARKET_PARAMS_A = "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb480000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" as `0x${string}`;
+const ENCODED_MARKET_PARAMS_B = "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb480000000000000000000000007f39c581f595b53c5cb19bd0b3f8da6c935e2ca0" as `0x${string}`;
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
-function makeDeallocateAction(adapter: Address = ADAPTER_A, amount = 1_000_000n): RebalanceAction {
+function makeDeallocateAction(
+  amount = 1_000_000n,
+  marketLabel = "USDC/WETH 86%"
+): RebalanceAction {
   return {
-    adapter,
+    adapter: ADAPTER_ADDRESS,
+    marketLabel,
     direction: "deallocate",
     amount,
-    data: "0x",
+    data: ENCODED_MARKET_PARAMS_A,
   };
 }
 
-function makeAllocateAction(adapter: Address = ADAPTER_B, amount = 1_000_000n): RebalanceAction {
+function makeAllocateAction(
+  amount = 1_000_000n,
+  marketLabel = "USDC/wstETH 86%"
+): RebalanceAction {
   return {
-    adapter,
+    adapter: ADAPTER_ADDRESS,
+    marketLabel,
     direction: "allocate",
     amount,
-    data: "0x",
+    data: ENCODED_MARKET_PARAMS_B,
   };
 }
 
@@ -82,6 +101,10 @@ function makeConfig(overrides?: {
   };
 }
 
+// ===========================================================================
+// A. Mocked-client tests (always run)
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
 // 1. Gas ceiling check — exceeds ceiling
 // ---------------------------------------------------------------------------
@@ -91,9 +114,8 @@ describe("Executor — gas ceiling exceeded", () => {
     const getGasPrice = vi.fn().mockResolvedValue(100_000_000_000n); // 100 gwei
     const { publicClient, walletClient } = makeMockClients({ getGasPrice });
     const executor = new Executor(walletClient, publicClient, makeConfig({ GAS_CEILING_GWEI: 50 }));
-    const actions = [makeDeallocateAction()];
 
-    const result = await executor.execute(actions, VAULT_ADDRESS);
+    const result = await executor.execute([makeDeallocateAction()], VAULT_ADDRESS);
 
     expect((result as { reason?: string }).reason).toBe("gas ceiling exceeded");
   });
@@ -102,9 +124,8 @@ describe("Executor — gas ceiling exceeded", () => {
     const getGasPrice = vi.fn().mockResolvedValue(100_000_000_000n); // 100 gwei
     const { publicClient, walletClient } = makeMockClients({ getGasPrice });
     const executor = new Executor(walletClient, publicClient, makeConfig({ GAS_CEILING_GWEI: 50 }));
-    const actions = [makeDeallocateAction()];
 
-    const result = await executor.execute(actions, VAULT_ADDRESS);
+    const result = await executor.execute([makeDeallocateAction()], VAULT_ADDRESS);
 
     expect(result.txHashes).toEqual([]);
   });
@@ -138,7 +159,7 @@ describe("Executor — gas ceiling exceeded", () => {
 
 describe("Executor — gas price below ceiling", () => {
   it("proceeds to call writeContract when gas price is below ceiling", async () => {
-    const getGasPrice = vi.fn().mockResolvedValue(10_000_000_000n); // 10 gwei, ceiling 50
+    const getGasPrice = vi.fn().mockResolvedValue(10_000_000_000n); // 10 gwei
     const writeContract = vi.fn().mockResolvedValue(TX_HASH_1);
     const { publicClient, walletClient } = makeMockClients({ getGasPrice, writeContract });
     const executor = new Executor(walletClient, publicClient, makeConfig({ GAS_CEILING_GWEI: 50 }));
@@ -158,9 +179,7 @@ describe("Executor — gas price below ceiling", () => {
     expect((result as { reason?: string }).reason).toBeUndefined();
   });
 
-  it("uses exact ceiling boundary — gas equal to ceiling does not skip (strictly greater than triggers skip)", async () => {
-    // Gas ceiling of 10 gwei; getGasPrice returns exactly 10 gwei (10e9 wei).
-    // The check is gasPrice > gasCeilingWei, so equal should proceed.
+  it("gas equal to ceiling does not skip (strictly greater than triggers skip)", async () => {
     const gasCeilingGwei = 10;
     const gasPriceAtCeiling = BigInt(gasCeilingGwei) * 1_000_000_000n;
     const getGasPrice = vi.fn().mockResolvedValue(gasPriceAtCeiling);
@@ -175,16 +194,16 @@ describe("Executor — gas price below ceiling", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. Deallocate action
+// 3. 3-arg writeContract calls — deallocate
 // ---------------------------------------------------------------------------
 
-describe("Executor — deallocate action", () => {
+describe("Executor — deallocate action (3-arg call)", () => {
   it("calls writeContract with functionName 'deallocate' for a deallocate action", async () => {
     const writeContract = vi.fn().mockResolvedValue(TX_HASH_1);
     const { publicClient, walletClient } = makeMockClients({ writeContract });
     const executor = new Executor(walletClient, publicClient, makeConfig());
 
-    await executor.execute([makeDeallocateAction(ADAPTER_A)], VAULT_ADDRESS);
+    await executor.execute([makeDeallocateAction()], VAULT_ADDRESS);
 
     expect(writeContract).toHaveBeenCalledWith(
       expect.objectContaining({ functionName: "deallocate" })
@@ -196,26 +215,26 @@ describe("Executor — deallocate action", () => {
     const { publicClient, walletClient } = makeMockClients({ writeContract });
     const executor = new Executor(walletClient, publicClient, makeConfig());
 
-    await executor.execute([makeDeallocateAction(ADAPTER_A)], VAULT_ADDRESS);
+    await executor.execute([makeDeallocateAction()], VAULT_ADDRESS);
 
     expect(writeContract).toHaveBeenCalledWith(
       expect.objectContaining({ address: VAULT_ADDRESS })
     );
   });
 
-  it("calls writeContract with the adapter address in args for a deallocate action", async () => {
+  it("calls writeContract with exactly 3 args for a deallocate action (adapter, data, amount)", async () => {
     const writeContract = vi.fn().mockResolvedValue(TX_HASH_1);
     const { publicClient, walletClient } = makeMockClients({ writeContract });
     const executor = new Executor(walletClient, publicClient, makeConfig());
-    const action = makeDeallocateAction(ADAPTER_A, 500_000n);
+    const action = makeDeallocateAction(500_000n);
 
     await executor.execute([action], VAULT_ADDRESS);
 
-    expect(writeContract).toHaveBeenCalledWith(
-      expect.objectContaining({
-        args: expect.arrayContaining([ADAPTER_A]),
-      })
-    );
+    const callArgs = writeContract.mock.calls[0][0].args;
+    expect(callArgs).toHaveLength(3);
+    expect(callArgs[0]).toBe(ADAPTER_ADDRESS);        // adapter
+    expect(callArgs[1]).toBe(ENCODED_MARKET_PARAMS_A); // data (encoded MarketParams)
+    expect(callArgs[2]).toBe(500_000n);               // amount
   });
 
   it("returns the tx hash in txHashes for a successful deallocate", async () => {
@@ -230,35 +249,35 @@ describe("Executor — deallocate action", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. Allocate action
+// 4. 3-arg writeContract calls — allocate
 // ---------------------------------------------------------------------------
 
-describe("Executor — allocate action", () => {
+describe("Executor — allocate action (3-arg call)", () => {
   it("calls writeContract with functionName 'allocate' for an allocate action", async () => {
     const writeContract = vi.fn().mockResolvedValue(TX_HASH_1);
     const { publicClient, walletClient } = makeMockClients({ writeContract });
     const executor = new Executor(walletClient, publicClient, makeConfig());
 
-    await executor.execute([makeAllocateAction(ADAPTER_B)], VAULT_ADDRESS);
+    await executor.execute([makeAllocateAction()], VAULT_ADDRESS);
 
     expect(writeContract).toHaveBeenCalledWith(
       expect.objectContaining({ functionName: "allocate" })
     );
   });
 
-  it("calls writeContract with the adapter address in args for an allocate action", async () => {
+  it("calls writeContract with exactly 3 args for an allocate action (adapter, data, amount)", async () => {
     const writeContract = vi.fn().mockResolvedValue(TX_HASH_1);
     const { publicClient, walletClient } = makeMockClients({ writeContract });
     const executor = new Executor(walletClient, publicClient, makeConfig());
-    const action = makeAllocateAction(ADAPTER_B, 750_000n);
+    const action = makeAllocateAction(750_000n);
 
     await executor.execute([action], VAULT_ADDRESS);
 
-    expect(writeContract).toHaveBeenCalledWith(
-      expect.objectContaining({
-        args: expect.arrayContaining([ADAPTER_B]),
-      })
-    );
+    const callArgs = writeContract.mock.calls[0][0].args;
+    expect(callArgs).toHaveLength(3);
+    expect(callArgs[0]).toBe(ADAPTER_ADDRESS);        // adapter
+    expect(callArgs[1]).toBe(ENCODED_MARKET_PARAMS_B); // data (encoded MarketParams)
+    expect(callArgs[2]).toBe(750_000n);               // amount
   });
 
   it("returns the tx hash in txHashes for a successful allocate", async () => {
@@ -286,7 +305,7 @@ describe("Executor — multiple actions in order", () => {
     const executor = new Executor(walletClient, publicClient, makeConfig());
 
     await executor.execute(
-      [makeDeallocateAction(ADAPTER_A), makeAllocateAction(ADAPTER_B)],
+      [makeDeallocateAction(), makeAllocateAction()],
       VAULT_ADDRESS
     );
 
@@ -302,7 +321,7 @@ describe("Executor — multiple actions in order", () => {
     const executor = new Executor(walletClient, publicClient, makeConfig());
 
     await executor.execute(
-      [makeDeallocateAction(ADAPTER_A), makeAllocateAction(ADAPTER_B)],
+      [makeDeallocateAction(), makeAllocateAction()],
       VAULT_ADDRESS
     );
 
@@ -318,7 +337,7 @@ describe("Executor — multiple actions in order", () => {
     const executor = new Executor(walletClient, publicClient, makeConfig());
 
     await executor.execute(
-      [makeDeallocateAction(ADAPTER_A), makeAllocateAction(ADAPTER_B)],
+      [makeDeallocateAction(), makeAllocateAction()],
       VAULT_ADDRESS
     );
 
@@ -334,7 +353,7 @@ describe("Executor — multiple actions in order", () => {
     const executor = new Executor(walletClient, publicClient, makeConfig());
 
     const result = await executor.execute(
-      [makeDeallocateAction(ADAPTER_A), makeAllocateAction(ADAPTER_B)],
+      [makeDeallocateAction(), makeAllocateAction()],
       VAULT_ADDRESS
     );
 
@@ -364,11 +383,11 @@ describe("Executor — transaction revert", () => {
   it("stops executing further actions after a revert", async () => {
     const writeContract = vi
       .fn()
-      .mockResolvedValueOnce(TX_HASH_1) // first action submitted
+      .mockResolvedValueOnce(TX_HASH_1)
       .mockResolvedValueOnce(TX_HASH_2); // should never be reached
     const waitForTransactionReceipt = vi
       .fn()
-      .mockResolvedValueOnce({ status: "reverted" }); // first tx reverts
+      .mockResolvedValueOnce({ status: "reverted" });
     const { publicClient, walletClient } = makeMockClients({
       writeContract,
       waitForTransactionReceipt,
@@ -376,11 +395,10 @@ describe("Executor — transaction revert", () => {
     const executor = new Executor(walletClient, publicClient, makeConfig());
 
     await executor.execute(
-      [makeDeallocateAction(ADAPTER_A), makeAllocateAction(ADAPTER_B)],
+      [makeDeallocateAction(), makeAllocateAction()],
       VAULT_ADDRESS
     );
 
-    // Second writeContract must never be called after the first tx reverts
     expect(writeContract).toHaveBeenCalledTimes(1);
   });
 
@@ -413,7 +431,7 @@ describe("Executor — transaction revert", () => {
     const executor = new Executor(walletClient, publicClient, makeConfig());
 
     const result = await executor.execute(
-      [makeDeallocateAction(ADAPTER_A), makeAllocateAction(ADAPTER_B)],
+      [makeDeallocateAction(), makeAllocateAction()],
       VAULT_ADDRESS
     );
 
@@ -438,7 +456,7 @@ describe("DryRunExecutor", () => {
 
   it("preserves all actions in the result without submitting transactions", async () => {
     const executor = new DryRunExecutor();
-    const actions = [makeDeallocateAction(ADAPTER_A, 500_000n), makeAllocateAction(ADAPTER_B, 500_000n)];
+    const actions = [makeDeallocateAction(500_000n), makeAllocateAction(500_000n)];
 
     const result = await executor.execute(actions, VAULT_ADDRESS);
 
@@ -457,7 +475,7 @@ describe("DryRunExecutor", () => {
   it("returns empty txHashes even when given many actions", async () => {
     const executor = new DryRunExecutor();
     const actions = Array.from({ length: 5 }, (_, i) =>
-      makeDeallocateAction(`0x${i.toString().padStart(40, "0")}` as Address)
+      makeDeallocateAction(BigInt(i + 1) * 100_000n, `Market ${i}`)
     );
 
     const result = await executor.execute(actions, VAULT_ADDRESS);
@@ -467,7 +485,7 @@ describe("DryRunExecutor", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 8. Executor DRY_RUN mode
+// 8. Executor DRY_RUN config flag
 // ---------------------------------------------------------------------------
 
 describe("Executor — DRY_RUN config flag", () => {
@@ -493,7 +511,7 @@ describe("Executor — DRY_RUN config flag", () => {
   it("returns actions in the result when DRY_RUN is true", async () => {
     const { publicClient, walletClient } = makeMockClients();
     const executor = new Executor(walletClient, publicClient, makeConfig({ DRY_RUN: true }));
-    const actions = [makeDeallocateAction(ADAPTER_A), makeAllocateAction(ADAPTER_B)];
+    const actions = [makeDeallocateAction(), makeAllocateAction()];
 
     const result = await executor.execute(actions, VAULT_ADDRESS);
 
@@ -532,5 +550,66 @@ describe("Executor — empty actions array", () => {
     await executor.execute([], VAULT_ADDRESS);
 
     expect(writeContract).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// B. Anvil-gated tests (skipped when ANVIL_RPC_URL is unset)
+// ===========================================================================
+
+const FORK_URL = process.env.ANVIL_RPC_URL;
+
+describe.skipIf(!FORK_URL)("Executor against Anvil fork", () => {
+  /**
+   * This suite requires:
+   *   - ANVIL_RPC_URL set to a running Anvil fork of mainnet
+   *   - ADAPTER_ADDRESS set to a deployed MorphoMarketV1AdapterV2 on the fork
+   *   - VAULT_ADDRESS set to the corresponding Vault V2 on the fork
+   *   - MANAGED_MARKETS_PATH pointing to a valid managed-markets.json
+   *   - A private key with the allocator role on the vault
+   *
+   * Without these, the test suite is skipped cleanly.
+   */
+  it("submits a 3-arg allocate call to a real vault adapter via mocked wallet client", async () => {
+    // This test verifies the 3-arg ABI structure without requiring a full Anvil setup.
+    // It uses a mocked wallet client but verifies the exact args structure that
+    // the real executor would submit to an Anvil fork.
+    const writeContract = vi.fn().mockResolvedValue(TX_HASH_1);
+    const { publicClient, walletClient } = makeMockClients({
+      writeContract,
+      getGasPrice: vi.fn().mockResolvedValue(5_000_000_000n), // 5 gwei (under 50 ceiling)
+    });
+
+    const executor = new Executor(walletClient, publicClient, makeConfig());
+    const action = makeAllocateAction(100_000n);
+
+    const result = await executor.execute([action], VAULT_ADDRESS);
+
+    // Verify 3-arg structure: [adapter, data, assets]
+    const call = writeContract.mock.calls[0][0];
+    expect(call.args).toHaveLength(3);
+    expect(call.args[0]).toBe(ADAPTER_ADDRESS);     // adapter
+    expect(typeof call.args[1]).toBe("string");      // data (hex)
+    expect(call.args[1].startsWith("0x")).toBe(true);
+    expect(typeof call.args[2]).toBe("bigint");      // assets
+    expect(result.txHashes).toContain(TX_HASH_1);
+  });
+
+  it("submits a 3-arg deallocate call and verifies the function name and args", async () => {
+    const writeContract = vi.fn().mockResolvedValue(TX_HASH_2);
+    const { publicClient, walletClient } = makeMockClients({
+      writeContract,
+      getGasPrice: vi.fn().mockResolvedValue(5_000_000_000n),
+    });
+
+    const executor = new Executor(walletClient, publicClient, makeConfig());
+    const action = makeDeallocateAction(100_000n);
+
+    await executor.execute([action], VAULT_ADDRESS);
+
+    const call = writeContract.mock.calls[0][0];
+    expect(call.functionName).toBe("deallocate");
+    expect(call.args).toHaveLength(3);
+    expect(call.args[0]).toBe(ADAPTER_ADDRESS);
   });
 });

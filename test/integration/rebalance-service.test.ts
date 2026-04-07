@@ -1,18 +1,24 @@
 /**
  * Integration tests for src/services/rebalance.service.ts — RebalanceService
  *
+ * Updated for V2 single-adapter model (Group 8.3):
+ *   - VaultState uses marketStates (not adapters)
+ *   - MarketAllocationState has caps array of length 3, relativeCap in WAD
+ *   - MorphoReader.readMarketsForManagedMarkets (not readMarketsForAdapters)
+ *   - VaultReader constructor takes 4 args
+ *   - RebalanceResult.newAllocations uses { marketLabel, percentage }
+ *   - RebalanceAction has marketLabel field
+ *
  * Strategy: mock all four dependencies at the class/interface boundary.
- *   - VaultReader   → mock object with vi.fn() for readFullState
- *   - MorphoReader  → mock object with vi.fn() for readMarketsForAdapters
+ *   - VaultReader   → mock object with vi.fn() for readFullState + activeMarkets
+ *   - MorphoReader  → mock object with vi.fn() for readMarketsForManagedMarkets
  *   - IExecutor     → mock object with vi.fn() for execute
  *   - Notifier      → mock object with vi.fn() for all notify methods
  *
  * Internal modules (engine.ts / strategy.ts / irm.ts) are NOT mocked.
  * computeRebalanceActions runs on the real mock data returned by the readers.
  *
- * Mock data uses a 1M USDC vault (1_000_000e6 = 1_000_000_000_000n) with
- * 2–3 adapters and market data that reliably triggers or suppresses rebalancing
- * depending on the scenario.
+ * Anvil-gating: tests requiring a real fork are gated on ANVIL_RPC_URL.
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -23,22 +29,32 @@ import type { MorphoReader } from "../../src/core/chain/morpho.js";
 import type { IExecutor } from "../../src/core/chain/executor.js";
 import type { Notifier } from "../../src/services/notifier.js";
 import type {
-  AdapterState,
+  ManagedMarket,
+  MarketAllocationState,
   IRMParams,
   MarketData,
   RebalanceAction,
   RebalanceResult,
   VaultState,
 } from "../../src/core/rebalancer/types.js";
+import { WAD } from "../../src/config/constants.js";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const VAULT_ADDRESS: Address = "0x1111111111111111111111111111111111111111";
-const ADAPTER_A: Address = "0x2222222222222222222222222222222222222222";
-const ADAPTER_B: Address = "0x3333333333333333333333333333333333333333";
-const ADAPTER_C: Address = "0x4444444444444444444444444444444444444444";
+const ADAPTER_ADDRESS: Address = "0x2222222222222222222222222222222222222222";
+
+// Market IDs
+const MARKET_ID_A = "0xaaaa000000000000000000000000000000000000000000000000000000000000" as Hash;
+const MARKET_ID_B = "0xbbbb000000000000000000000000000000000000000000000000000000000000" as Hash;
+const MARKET_ID_C = "0xcccc000000000000000000000000000000000000000000000000000000000000" as Hash;
+
+// Cap IDs
+const CAP_ID_0 = "0xd000000000000000000000000000000000000000000000000000000000000000" as Hash;
+const CAP_ID_1 = "0xe000000000000000000000000000000000000000000000000000000000000000" as Hash;
+const CAP_ID_2 = "0xf000000000000000000000000000000000000000000000000000000000000000" as Hash;
 
 const TX_HASH_1 =
   "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as Hash;
@@ -52,21 +68,13 @@ const TOTAL_ASSETS_1M = 1_000_000_000_000n;
 // Fixtures
 // ---------------------------------------------------------------------------
 
-/**
- * IRM params for a mid-utilization market (~60% util, ~5% APY).
- * Used for markets where we want mild yield without triggering concentration
- * penalties.
- */
 const IRM_PARAMS_STANDARD: IRMParams = {
   baseRate: 0n,
-  slope1: 3_170_979_198n, // ~10% APY / year in WAD-per-second at kink
+  slope1: 3_170_979_198n,
   slope2: 31_709_791_983n,
   optimalUtilization: 900_000_000_000_000_000n, // 90% in WAD
 };
 
-/**
- * IRM params for a high-APY market (~80% util, ~12% APY).
- */
 const IRM_PARAMS_HIGH_APY: IRMParams = {
   baseRate: 0n,
   slope1: 3_170_979_198n,
@@ -74,33 +82,45 @@ const IRM_PARAMS_HIGH_APY: IRMParams = {
   optimalUtilization: 900_000_000_000_000_000n,
 };
 
-/**
- * Build a standard AdapterState.
- */
-function makeAdapterState(
-  address: Address,
-  realAssets: bigint,
-  totalAssets: bigint,
-  absoluteCap = 0n,
-  relativeCap = 10_000
-): AdapterState {
-  const allocationPercentage =
-    totalAssets > 0n
-      ? Number((realAssets * 10_000n) / totalAssets) / 10_000
-      : 0;
+/** Build a ManagedMarket. */
+function makeManagedMarket(label: string, marketId: Hash): ManagedMarket {
   return {
-    address,
-    adapterType: "morpho-market-v1",
-    realAssets,
-    allocationPercentage,
-    absoluteCap,
-    relativeCap,
+    label,
+    marketId,
+    marketParams: {
+      loanToken: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" as Address,
+      collateralToken: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" as Address,
+      oracle: "0x3333333333333333333333333333333333333333" as Address,
+      irm: "0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC" as Address,
+      lltv: 860_000_000_000_000_000n,
+    },
+    capIds: [CAP_ID_0, CAP_ID_1, CAP_ID_2],
   };
 }
 
-/**
- * Build a MarketData object.
- */
+/** Build a MarketAllocationState with full WAD relative caps (no restriction). */
+function makeMarketAllocationState(
+  market: ManagedMarket,
+  allocation: bigint,
+  totalAssets: bigint
+): MarketAllocationState {
+  const allocationPercentage =
+    totalAssets > 0n
+      ? Number((allocation * 10_000n) / totalAssets) / 10_000
+      : 0;
+  return {
+    market,
+    allocation,
+    allocationPercentage,
+    caps: [
+      { id: CAP_ID_0, absoluteCap: 1_000_000_000_000_000n, relativeCap: WAD },
+      { id: CAP_ID_1, absoluteCap: 1_000_000_000_000_000n, relativeCap: WAD },
+      { id: CAP_ID_2, absoluteCap: 1_000_000_000_000_000n, relativeCap: WAD },
+    ],
+  };
+}
+
+/** Build a MarketData object. */
 function makeMarketData(
   marketId: Hash,
   totalSupply: bigint,
@@ -113,9 +133,7 @@ function makeMarketData(
     totalSupply > 0n
       ? Number((totalBorrow * 1_000_000n) / totalSupply) / 1_000_000
       : 0;
-  // Approximate supply APY: borrowRate * SECONDS_PER_YEAR * utilization / WAD
   const SECONDS_PER_YEAR = 31_536_000n;
-  const WAD = 1_000_000_000_000_000_000n;
   const borrowRate = irmParams.slope1;
   const currentSupplyAPY =
     (Number(borrowRate * SECONDS_PER_YEAR) / Number(WAD)) * utilization;
@@ -131,105 +149,99 @@ function makeMarketData(
   };
 }
 
+const MARKET_A = makeManagedMarket("USDC/WETH 86%", MARKET_ID_A);
+const MARKET_B = makeManagedMarket("USDC/wstETH 86%", MARKET_ID_B);
+const MARKET_C = makeManagedMarket("USDC/WBTC 86%", MARKET_ID_C);
+
 /**
- * A VaultState that produces rebalance actions (imbalanced adapters, different
- * APYs).  Adapter A holds 90% of assets in a low-APY market; Adapter B holds
- * 10% in a high-APY market.  With driftThresholdBps=0 the strategy will
- * produce at least one action.
+ * A VaultState that produces rebalance actions (imbalanced markets, different APYs).
+ * Market A holds 90% of assets in a low-APY market; Market B holds 10% in high-APY market.
  */
 function makeImbalancedVaultState(): VaultState {
-  const assetsA = (TOTAL_ASSETS_1M * 9n) / 10n; // 900 000 USDC
-  const assetsB = TOTAL_ASSETS_1M / 10n; // 100 000 USDC
-
-  const adapterA = makeAdapterState(ADAPTER_A, assetsA, TOTAL_ASSETS_1M);
-  const adapterB = makeAdapterState(ADAPTER_B, assetsB, TOTAL_ASSETS_1M);
+  const assetsA = (TOTAL_ASSETS_1M * 9n) / 10n; // 900k USDC
+  const assetsB = TOTAL_ASSETS_1M / 10n;          // 100k USDC
 
   return {
     vaultAddress: VAULT_ADDRESS,
+    adapterAddress: ADAPTER_ADDRESS,
     totalAssets: TOTAL_ASSETS_1M,
-    adapters: [adapterA, adapterB],
-    markets: [],
+    marketStates: [
+      makeMarketAllocationState(MARKET_A, assetsA, TOTAL_ASSETS_1M),
+      makeMarketAllocationState(MARKET_B, assetsB, TOTAL_ASSETS_1M),
+    ],
+    marketData: [],
   };
 }
 
-/**
- * Market data for the imbalanced vault state.
- * Market A: large, low utilization → low APY.
- * Market B: smaller, high utilization → higher APY.
- */
+/** Market data for the imbalanced vault. */
 function makeImbalancedMarkets(): MarketData[] {
-  const marketA = makeMarketData(
-    "0xaaaa000000000000000000000000000000000000000000000000000000000000" as Hash,
-    100_000_000_000_000n, // 100M USDC supply — A has tiny concentration
-    10_000_000_000_000n,  // 10% utilization → very low APY
-    IRM_PARAMS_STANDARD
-  );
-  const marketB = makeMarketData(
-    "0xbbbb000000000000000000000000000000000000000000000000000000000000" as Hash,
-    5_000_000_000_000n, // 5M USDC supply
-    4_500_000_000_000n, // 90% utilization → high APY
-    IRM_PARAMS_HIGH_APY
-  );
-  return [marketA, marketB];
-}
-
-/**
- * A VaultState that produces NO rebalance actions.
- * Single adapter holds 100% of assets — target equals current, delta = 0.
- */
-function makeBalancedVaultState(): VaultState {
-  const adapterA = makeAdapterState(
-    ADAPTER_A,
-    TOTAL_ASSETS_1M,
-    TOTAL_ASSETS_1M
-  );
-
-  return {
-    vaultAddress: VAULT_ADDRESS,
-    totalAssets: TOTAL_ASSETS_1M,
-    adapters: [adapterA],
-    markets: [],
-  };
-}
-
-/**
- * Market data for the balanced vault state.
- * Single market — the sole adapter holds all assets at target already.
- */
-function makeBalancedMarkets(): MarketData[] {
   return [
     makeMarketData(
-      "0xcccc000000000000000000000000000000000000000000000000000000000000" as Hash,
-      10_000_000_000_000n,
-      8_000_000_000_000n, // 80% utilization — decent APY, single adapter
+      MARKET_ID_A,
+      100_000_000_000_000n, // 100M supply
+      10_000_000_000_000n,  // 10% utilization → low APY
       IRM_PARAMS_STANDARD
+    ),
+    makeMarketData(
+      MARKET_ID_B,
+      5_000_000_000_000n, // 5M supply
+      4_500_000_000_000n, // 90% utilization → high APY
+      IRM_PARAMS_HIGH_APY
     ),
   ];
 }
 
 /**
- * A realistic RebalanceResult returned by a successful executor.execute() call.
+ * A VaultState that produces NO rebalance actions.
+ * Single market holds 100% of assets — target equals current, delta = 0.
  */
+function makeBalancedVaultState(): VaultState {
+  return {
+    vaultAddress: VAULT_ADDRESS,
+    adapterAddress: ADAPTER_ADDRESS,
+    totalAssets: TOTAL_ASSETS_1M,
+    marketStates: [
+      makeMarketAllocationState(MARKET_C, TOTAL_ASSETS_1M, TOTAL_ASSETS_1M),
+    ],
+    marketData: [],
+  };
+}
+
+/** Market data for the balanced vault. */
+function makeBalancedMarkets(): MarketData[] {
+  return [
+    makeMarketData(
+      MARKET_ID_C,
+      10_000_000_000_000n,
+      8_000_000_000_000n, // 80% utilization
+      IRM_PARAMS_STANDARD
+    ),
+  ];
+}
+
+/** A realistic RebalanceResult using the new V2 shape. */
 function makeSuccessResult(): RebalanceResult {
   return {
     actions: [
       {
-        adapter: ADAPTER_A,
+        adapter: ADAPTER_ADDRESS,
+        marketLabel: "USDC/WETH 86%",
         direction: "deallocate",
         amount: 300_000_000_000n,
-        data: "0x",
+        data: "0x1234abcd",
       },
       {
-        adapter: ADAPTER_B,
+        adapter: ADAPTER_ADDRESS,
+        marketLabel: "USDC/wstETH 86%",
         direction: "allocate",
         amount: 300_000_000_000n,
-        data: "0x",
+        data: "0x5678efgh" as `0x${string}`,
       },
     ],
     txHashes: [TX_HASH_1, TX_HASH_2],
     newAllocations: [
-      { adapter: ADAPTER_A, percentage: 0.6 },
-      { adapter: ADAPTER_B, percentage: 0.4 },
+      { marketLabel: "USDC/WETH 86%", percentage: 90 },
+      { marketLabel: "USDC/wstETH 86%", percentage: 10 },
     ],
     timestamp: new Date().toISOString(),
   };
@@ -239,10 +251,6 @@ function makeSuccessResult(): RebalanceResult {
 // Mock factory
 // ---------------------------------------------------------------------------
 
-/**
- * Minimal config satisfying the RebalanceService constructor requirements.
- * driftThresholdBps=0 ensures actions are generated for imbalanced state.
- */
 function makeConfig(driftThresholdBps = 0) {
   return {
     VAULT_ADDRESS,
@@ -254,20 +262,14 @@ function makeConfig(driftThresholdBps = 0) {
   };
 }
 
-/**
- * Create fresh vi.fn() mocks for all four dependencies.
- * Each call returns independent mocks so tests do not share state.
- */
 function makeDeps() {
   const vaultReader = {
     readFullState: vi.fn(),
-    readTotalAssets: vi.fn(),
-    readAdapters: vi.fn(),
-    readCaps: vi.fn(),
+    activeMarkets: [MARKET_A, MARKET_B] as readonly ManagedMarket[],
   } as unknown as VaultReader;
 
   const morphoReader = {
-    readMarketsForAdapters: vi.fn(),
+    readMarketsForManagedMarkets: vi.fn(),
     readMarketData: vi.fn(),
     readIRMParams: vi.fn(),
   } as unknown as MorphoReader;
@@ -286,7 +288,7 @@ function makeDeps() {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: build a RebalanceService wired for a successful cycle with actions
+// Helpers: build wired services
 // ---------------------------------------------------------------------------
 
 function buildServiceWithActions(deps = makeDeps()) {
@@ -294,7 +296,7 @@ function buildServiceWithActions(deps = makeDeps()) {
   const successResult = makeSuccessResult();
 
   vi.mocked(vaultReader.readFullState).mockResolvedValue(makeImbalancedVaultState());
-  vi.mocked(morphoReader.readMarketsForAdapters).mockResolvedValue(
+  vi.mocked(morphoReader.readMarketsForManagedMarkets).mockResolvedValue(
     makeImbalancedMarkets()
   );
   vi.mocked(executor.execute).mockResolvedValue(successResult);
@@ -307,21 +309,23 @@ function buildServiceWithActions(deps = makeDeps()) {
     morphoReader,
     executor,
     notifier,
-    makeConfig(0) // driftThresholdBps=0 ensures actions are generated
+    makeConfig(0)
   );
 
   return { service, deps, successResult };
 }
 
-// ---------------------------------------------------------------------------
-// Helper: build a RebalanceService wired for a no-rebalance cycle
-// ---------------------------------------------------------------------------
-
 function buildServiceNoActions(deps = makeDeps()) {
   const { vaultReader, morphoReader, executor, notifier } = deps;
 
+  // Point vaultReader.activeMarkets at balanced markets
+  Object.defineProperty(vaultReader, "activeMarkets", {
+    get: vi.fn().mockReturnValue([MARKET_C]),
+    configurable: true,
+  });
+
   vi.mocked(vaultReader.readFullState).mockResolvedValue(makeBalancedVaultState());
-  vi.mocked(morphoReader.readMarketsForAdapters).mockResolvedValue(
+  vi.mocked(morphoReader.readMarketsForManagedMarkets).mockResolvedValue(
     makeBalancedMarkets()
   );
   vi.mocked(notifier.notifyRebalanceSuccess).mockResolvedValue(undefined);
@@ -333,7 +337,7 @@ function buildServiceNoActions(deps = makeDeps()) {
     morphoReader,
     executor,
     notifier,
-    makeConfig(500) // 5% threshold — single adapter at 100% → target=current → no action
+    makeConfig(500)
   );
 
   return { service, deps };
@@ -365,14 +369,13 @@ describe("RebalanceService — cycle lock", () => {
     const deps = makeDeps();
     const { vaultReader, morphoReader, executor, notifier } = deps;
 
-    // Simulate a slow readFullState so the lock is held during the second call.
     let resolveRead!: (v: VaultState) => void;
     const readPromise = new Promise<VaultState>((res) => {
       resolveRead = res;
     });
 
     vi.mocked(vaultReader.readFullState).mockReturnValue(readPromise);
-    vi.mocked(morphoReader.readMarketsForAdapters).mockResolvedValue([]);
+    vi.mocked(morphoReader.readMarketsForManagedMarkets).mockResolvedValue([]);
     vi.mocked(executor.execute).mockResolvedValue(makeSuccessResult());
     vi.mocked(notifier.notifyRebalanceSuccess).mockResolvedValue(undefined);
 
@@ -384,13 +387,9 @@ describe("RebalanceService — cycle lock", () => {
       makeConfig()
     );
 
-    // Start the first run — it will hang waiting on readFullState.
     const firstRun = service.run();
-
-    // While first run is in-flight, a second call should return null immediately.
     const secondResult = await service.run();
 
-    // Resolve the first run so we can clean up.
     resolveRead(makeBalancedVaultState());
     await firstRun;
 
@@ -407,7 +406,7 @@ describe("RebalanceService — cycle lock", () => {
     });
 
     vi.mocked(vaultReader.readFullState).mockReturnValue(readPromise);
-    vi.mocked(morphoReader.readMarketsForAdapters).mockResolvedValue([]);
+    vi.mocked(morphoReader.readMarketsForManagedMarkets).mockResolvedValue([]);
     vi.mocked(executor.execute).mockResolvedValue(makeSuccessResult());
     vi.mocked(notifier.notifyRebalanceSuccess).mockResolvedValue(undefined);
 
@@ -420,14 +419,11 @@ describe("RebalanceService — cycle lock", () => {
     );
 
     const firstRun = service.run();
-
-    // Second call while first is running — must not trigger another readFullState.
     await service.run();
 
     resolveRead(makeBalancedVaultState());
     await firstRun;
 
-    // readFullState called exactly once (by the first run, not the second).
     expect(vi.mocked(vaultReader.readFullState)).toHaveBeenCalledTimes(1);
   });
 
@@ -443,9 +439,7 @@ describe("RebalanceService — cycle lock", () => {
     const deps = makeDeps();
     const { vaultReader, morphoReader, executor, notifier } = deps;
 
-    vi.mocked(vaultReader.readFullState).mockRejectedValue(
-      new Error("RPC timeout")
-    );
+    vi.mocked(vaultReader.readFullState).mockRejectedValue(new Error("RPC timeout"));
     vi.mocked(notifier.notifyHealthIssue).mockResolvedValue(undefined);
 
     const service = new RebalanceService(
@@ -472,21 +466,18 @@ describe("RebalanceService — full successful cycle", () => {
 
     await service.run();
 
-    expect(
-      vi.mocked(deps.vaultReader.readFullState)
-    ).toHaveBeenCalledTimes(1);
+    // Service calls readFullState twice: once in READ phase, once in _readNewAllocations
+    expect(vi.mocked(deps.vaultReader.readFullState)).toHaveBeenCalledTimes(2);
   });
 
-  it("calls morphoReader.readMarketsForAdapters() with adapters from vault state", async () => {
+  it("calls morphoReader.readMarketsForManagedMarkets() with active markets", async () => {
     const { service, deps } = buildServiceWithActions();
-    const vaultState = makeImbalancedVaultState();
-    vi.mocked(deps.vaultReader.readFullState).mockResolvedValue(vaultState);
 
     await service.run();
 
     expect(
-      vi.mocked(deps.morphoReader.readMarketsForAdapters)
-    ).toHaveBeenCalledWith(vaultState.adapters);
+      vi.mocked(deps.morphoReader.readMarketsForManagedMarkets)
+    ).toHaveBeenCalledTimes(1);
   });
 
   it("calls executor.execute() with the computed actions when actions are present", async () => {
@@ -495,7 +486,6 @@ describe("RebalanceService — full successful cycle", () => {
     await service.run();
 
     expect(vi.mocked(deps.executor.execute)).toHaveBeenCalledTimes(1);
-    // First arg should be an array of RebalanceAction objects
     const [actionsArg] = vi.mocked(deps.executor.execute).mock.calls[0];
     expect(Array.isArray(actionsArg)).toBe(true);
     expect((actionsArg as RebalanceAction[]).length).toBeGreaterThan(0);
@@ -664,15 +654,11 @@ describe("RebalanceService — error boundaries", () => {
     const deps = makeDeps();
     const { vaultReader, morphoReader, executor, notifier } = deps;
 
-    vi.mocked(vaultReader.readFullState).mockResolvedValue(
-      makeImbalancedVaultState()
-    );
-    vi.mocked(morphoReader.readMarketsForAdapters).mockResolvedValue(
+    vi.mocked(vaultReader.readFullState).mockResolvedValue(makeImbalancedVaultState());
+    vi.mocked(morphoReader.readMarketsForManagedMarkets).mockResolvedValue(
       makeImbalancedMarkets()
     );
-    vi.mocked(executor.execute).mockRejectedValue(
-      new Error("transaction reverted")
-    );
+    vi.mocked(executor.execute).mockRejectedValue(new Error("transaction reverted"));
     vi.mocked(notifier.notifyRebalanceFailed).mockResolvedValue(undefined);
 
     const service = new RebalanceService(
@@ -692,15 +678,11 @@ describe("RebalanceService — error boundaries", () => {
     const deps = makeDeps();
     const { vaultReader, morphoReader, executor, notifier } = deps;
 
-    vi.mocked(vaultReader.readFullState).mockResolvedValue(
-      makeImbalancedVaultState()
-    );
-    vi.mocked(morphoReader.readMarketsForAdapters).mockResolvedValue(
+    vi.mocked(vaultReader.readFullState).mockResolvedValue(makeImbalancedVaultState());
+    vi.mocked(morphoReader.readMarketsForManagedMarkets).mockResolvedValue(
       makeImbalancedMarkets()
     );
-    vi.mocked(executor.execute).mockRejectedValue(
-      new Error("transaction reverted")
-    );
+    vi.mocked(executor.execute).mockRejectedValue(new Error("transaction reverted"));
     vi.mocked(notifier.notifyRebalanceFailed).mockResolvedValue(undefined);
 
     const service = new RebalanceService(
@@ -721,10 +703,8 @@ describe("RebalanceService — error boundaries", () => {
     const { vaultReader, morphoReader, executor, notifier } = deps;
     const successResult = makeSuccessResult();
 
-    vi.mocked(vaultReader.readFullState).mockResolvedValue(
-      makeImbalancedVaultState()
-    );
-    vi.mocked(morphoReader.readMarketsForAdapters).mockResolvedValue(
+    vi.mocked(vaultReader.readFullState).mockResolvedValue(makeImbalancedVaultState());
+    vi.mocked(morphoReader.readMarketsForManagedMarkets).mockResolvedValue(
       makeImbalancedMarkets()
     );
     vi.mocked(executor.execute).mockResolvedValue(successResult);
@@ -742,7 +722,6 @@ describe("RebalanceService — error boundaries", () => {
 
     const result = await service.run();
 
-    // Telegram failure must not crash run() — result is still returned.
     expect(result).toEqual(successResult);
   });
 
@@ -765,7 +744,6 @@ describe("RebalanceService — error boundaries", () => {
       makeConfig()
     );
 
-    // Must not throw even though both vaultReader and notifier fail.
     let result: RebalanceResult | null | "threw" = "threw";
     try {
       result = await service.run();
@@ -796,9 +774,7 @@ describe("RebalanceService — state tracking", () => {
     const deps = makeDeps();
     const { vaultReader, morphoReader, executor, notifier } = deps;
 
-    vi.mocked(vaultReader.readFullState).mockRejectedValue(
-      new Error("RPC down")
-    );
+    vi.mocked(vaultReader.readFullState).mockRejectedValue(new Error("RPC down"));
     vi.mocked(notifier.notifyHealthIssue).mockResolvedValue(undefined);
 
     const service = new RebalanceService(
@@ -811,7 +787,6 @@ describe("RebalanceService — state tracking", () => {
 
     await service.run();
 
-    // lastCheckTimestamp is set before the try block — it must be set even on error.
     expect(service.lastCheckTimestamp).toBeInstanceOf(Date);
   });
 
@@ -827,10 +802,8 @@ describe("RebalanceService — state tracking", () => {
     const deps = makeDeps();
     const { vaultReader, morphoReader, executor, notifier } = deps;
 
-    vi.mocked(vaultReader.readFullState).mockResolvedValue(
-      makeImbalancedVaultState()
-    );
-    vi.mocked(morphoReader.readMarketsForAdapters).mockResolvedValue(
+    vi.mocked(vaultReader.readFullState).mockResolvedValue(makeImbalancedVaultState());
+    vi.mocked(morphoReader.readMarketsForManagedMarkets).mockResolvedValue(
       makeImbalancedMarkets()
     );
     vi.mocked(executor.execute).mockRejectedValue(new Error("revert"));
@@ -888,5 +861,42 @@ describe("RebalanceService — state tracking", () => {
     const status = service.getStatus();
 
     expect(status.lastRebalanceResult).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. New V2 shape — newAllocations uses marketLabel
+// ---------------------------------------------------------------------------
+
+describe("RebalanceService — V2 newAllocations shape", () => {
+  it("lastRebalanceResult.newAllocations entries have marketLabel and percentage", async () => {
+    const deps = makeDeps();
+    const { vaultReader, morphoReader, executor, notifier } = deps;
+    const successResult = makeSuccessResult();
+
+    vi.mocked(vaultReader.readFullState).mockResolvedValue(makeImbalancedVaultState());
+    vi.mocked(morphoReader.readMarketsForManagedMarkets).mockResolvedValue(
+      makeImbalancedMarkets()
+    );
+    vi.mocked(executor.execute).mockResolvedValue(successResult);
+    vi.mocked(notifier.notifyRebalanceSuccess).mockResolvedValue(undefined);
+
+    const service = new RebalanceService(
+      vaultReader,
+      morphoReader,
+      executor,
+      notifier,
+      makeConfig(0)
+    );
+
+    await service.run();
+
+    const result = service.lastRebalanceResult;
+    expect(result).not.toBeNull();
+
+    for (const alloc of result!.newAllocations) {
+      expect(typeof alloc.marketLabel).toBe("string");
+      expect(typeof alloc.percentage).toBe("number");
+    }
   });
 });
