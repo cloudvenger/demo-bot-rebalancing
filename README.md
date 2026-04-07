@@ -21,6 +21,15 @@ Every N minutes (cron):
 
 The strategy uses a **hybrid IRM** approach: read Interest Rate Model parameters on-chain once per cycle, then simulate post-rebalance rates off-chain in TypeScript. This avoids chasing displayed APY — the bot predicts what it will *actually* earn after moving capital.
 
+
+## Architecture
+
+The bot follows a **service-oriented** pattern with strict separation of concerns. The strategy module is **pure** (no async, no RPC) — all chain interaction is isolated in the `chain/` layer. Each error boundary is independent: a Telegram outage never blocks rebalancing, a failed transaction never crashes the bot.
+
+Guided walkthrough of the design and implementation: [docs/rebalancing/presentation.md](docs/rebalancing/presentation.md)
+
+Full architecture with diagrams: [docs/rebalancing/architecture.md](docs/rebalancing/architecture.md)
+
 ## Stack
 
 | Layer | Tool |
@@ -113,14 +122,6 @@ docs/
     architecture.md              # Service architecture and patterns
     vault-setup-guide.md         # Step-by-step vault creation tutorial
 ```
-
-## Architecture
-
-The bot follows a **service-oriented** pattern with strict separation of concerns. The strategy module is **pure** (no async, no RPC) — all chain interaction is isolated in the `chain/` layer. Each error boundary is independent: a Telegram outage never blocks rebalancing, a failed transaction never crashes the bot.
-
-Guided walkthrough of the design and implementation: [docs/rebalancing/presentation.md](docs/rebalancing/presentation.md)
-
-Full architecture with diagrams: [docs/rebalancing/architecture.md](docs/rebalancing/architecture.md)
 
 ## Vault setup
 
