@@ -40,6 +40,10 @@ script/out/
 lib/*
 !lib/forge-std
 cache/
+broadcast/
+
+# Local Anvil-fork test artifacts (per-run, never commit)
+managed-markets.anvil.json
 
 # Temporary files
 *.tmp

@@ -24,10 +24,18 @@ const lltvSchema = z
   .transform((v) => BigInt(v));
 
 // ---------------------------------------------------------------------------
-// MarketParams schema
+// Top-level file schema
 // ---------------------------------------------------------------------------
+//
+// The JSON file is a top-level array of market entries with market params
+// fields inlined at the root of each entry (no nested `marketParams` object).
+// This matches the shape that script/DeployVault.s.sol both reads as input
+// and logs in its STEP H summary, so the operator can copy/paste between
+// them without reshaping.
 
-const marketParamsSchema = z.object({
+const managedMarketEntrySchema = z.object({
+  /** Human-readable label used in logs and Telegram alerts, e.g. "USDC/WETH 86%" */
+  label: z.string().min(1, { message: "label must not be empty" }),
   /** ERC-20 loan token — must match the vault's underlying asset */
   loanToken: addressSchema,
   /** ERC-20 collateral token */
@@ -44,21 +52,9 @@ const marketParamsSchema = z.object({
   lltv: lltvSchema,
 });
 
-// ---------------------------------------------------------------------------
-// Top-level file schema
-// ---------------------------------------------------------------------------
-
-const managedMarketEntrySchema = z.object({
-  /** Human-readable label used in logs and Telegram alerts, e.g. "USDC/WETH 86%" */
-  label: z.string().min(1, { message: "label must not be empty" }),
-  marketParams: marketParamsSchema,
-});
-
-const managedMarketsFileSchema = z.object({
-  markets: z
-    .array(managedMarketEntrySchema)
-    .min(1, { message: "markets array must contain at least one entry" }),
-});
+const managedMarketsFileSchema = z
+  .array(managedMarketEntrySchema)
+  .min(1, { message: "managed markets file must contain at least one entry" });
 
 // ---------------------------------------------------------------------------
 // MarketParams ABI components (used to derive marketId)
@@ -154,16 +150,14 @@ export function loadManagedMarkets(path: string): ManagedMarket[] {
     );
   }
 
-  return result.data.markets.map((entry) => {
-    const { loanToken, collateralToken, oracle, irm, lltv } = entry.marketParams;
-
+  return result.data.map((entry) => {
     // Addresses are validated as strings by zod; cast to the viem Address type.
     const marketParams = {
-      loanToken: loanToken as `0x${string}`,
-      collateralToken: collateralToken as `0x${string}`,
-      oracle: oracle as `0x${string}`,
-      irm: irm as `0x${string}`,
-      lltv,
+      loanToken: entry.loanToken as `0x${string}`,
+      collateralToken: entry.collateralToken as `0x${string}`,
+      oracle: entry.oracle as `0x${string}`,
+      irm: entry.irm as `0x${string}`,
+      lltv: entry.lltv,
     };
 
     const marketId = deriveMarketId(marketParams);

@@ -14,6 +14,11 @@
  * because the function under test does real IO and we want to exercise the full
  * read-parse-validate-transform pipeline without mocking the module itself.
  *
+ * Input shape: the JSON file is a flat top-level array where each entry has
+ * `label` plus the market-params fields inlined at the root. This matches the
+ * shape that script/DeployVault.s.sol both reads and logs in STEP H, so the
+ * operator can copy/paste between the two without reshaping.
+ *
  * marketId independence: the expected marketId is recomputed in each test using
  * the same viem primitives (encodeAbiParameters + keccak256) the source
  * uses — this validates both the function's output AND the derivation formula.
@@ -96,40 +101,34 @@ function computeMarketId(params: {
 }
 
 // ---------------------------------------------------------------------------
-// Reusable fixture data
+// Reusable fixture data — flat shape matching the deploy script's JSON output.
 // ---------------------------------------------------------------------------
 
 const MARKET_A = {
   label: "USDC/WETH 86%",
-  marketParams: {
-    loanToken: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-    collateralToken: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-    oracle: "0x0000000000000000000000000000000000000001",
-    irm: "0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC",
-    lltv: "860000000000000000",
-  },
+  loanToken: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+  collateralToken: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+  oracle: "0x0000000000000000000000000000000000000001",
+  irm: "0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC",
+  lltv: "860000000000000000",
 };
 
 const MARKET_B = {
   label: "USDC/wstETH 77%",
-  marketParams: {
-    loanToken: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-    collateralToken: "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0",
-    oracle: "0x0000000000000000000000000000000000000002",
-    irm: "0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC",
-    lltv: "770000000000000000",
-  },
+  loanToken: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+  collateralToken: "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0",
+  oracle: "0x0000000000000000000000000000000000000002",
+  irm: "0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC",
+  lltv: "770000000000000000",
 };
 
 const MARKET_C = {
   label: "USDC/cbBTC 80%",
-  marketParams: {
-    loanToken: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-    collateralToken: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
-    oracle: "0x0000000000000000000000000000000000000003",
-    irm: "0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC",
-    lltv: "800000000000000000",
-  },
+  loanToken: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+  collateralToken: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+  oracle: "0x0000000000000000000000000000000000000003",
+  irm: "0x870aC11D48B15DB9a138Cf899d20F13F79Ba00BC",
+  lltv: "800000000000000000",
 };
 
 // ---------------------------------------------------------------------------
@@ -138,19 +137,19 @@ const MARKET_C = {
 
 describe("valid JSON — single market", () => {
   it("returns an array of length 1", () => {
-    const path = writeTempJson({ markets: [MARKET_A] });
+    const path = writeTempJson([MARKET_A]);
     const result = loadManagedMarkets(path);
     expect(result).toHaveLength(1);
   });
 
   it("returned element has label matching the input", () => {
-    const path = writeTempJson({ markets: [MARKET_A] });
+    const path = writeTempJson([MARKET_A]);
     const result = loadManagedMarkets(path);
     expect(result[0].label).toBe("USDC/WETH 86%");
   });
 
   it("returned element has marketParams.loanToken matching the input", () => {
-    const path = writeTempJson({ markets: [MARKET_A] });
+    const path = writeTempJson([MARKET_A]);
     const result = loadManagedMarkets(path);
     expect(result[0].marketParams.loanToken).toBe(
       "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
@@ -158,7 +157,7 @@ describe("valid JSON — single market", () => {
   });
 
   it("returned element has marketParams.collateralToken matching the input", () => {
-    const path = writeTempJson({ markets: [MARKET_A] });
+    const path = writeTempJson([MARKET_A]);
     const result = loadManagedMarkets(path);
     expect(result[0].marketParams.collateralToken).toBe(
       "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
@@ -166,25 +165,25 @@ describe("valid JSON — single market", () => {
   });
 
   it("returned element has lltv as a bigint", () => {
-    const path = writeTempJson({ markets: [MARKET_A] });
+    const path = writeTempJson([MARKET_A]);
     const result = loadManagedMarkets(path);
     expect(typeof result[0].marketParams.lltv).toBe("bigint");
   });
 
   it("returned element has lltv equal to 860000000000000000n", () => {
-    const path = writeTempJson({ markets: [MARKET_A] });
+    const path = writeTempJson([MARKET_A]);
     const result = loadManagedMarkets(path);
     expect(result[0].marketParams.lltv).toBe(860000000000000000n);
   });
 
   it("returned element has a non-zero marketId (non-empty hex string)", () => {
-    const path = writeTempJson({ markets: [MARKET_A] });
+    const path = writeTempJson([MARKET_A]);
     const result = loadManagedMarkets(path);
     expect(result[0].marketId).toMatch(/^0x[0-9a-fA-F]{64}$/);
   });
 
   it("returned element has marketId equal to the independently computed keccak256(encodeAbiParameters(marketParams))", () => {
-    const path = writeTempJson({ markets: [MARKET_A] });
+    const path = writeTempJson([MARKET_A]);
     const result = loadManagedMarkets(path);
 
     const expected = computeMarketId({
@@ -199,7 +198,7 @@ describe("valid JSON — single market", () => {
   });
 
   it("returned element has capIds initialized to an empty array", () => {
-    const path = writeTempJson({ markets: [MARKET_A] });
+    const path = writeTempJson([MARKET_A]);
     const result = loadManagedMarkets(path);
     expect(result[0].capIds).toEqual([]);
   });
@@ -211,13 +210,13 @@ describe("valid JSON — single market", () => {
 
 describe("valid JSON — three markets", () => {
   it("returns an array of length 3", () => {
-    const path = writeTempJson({ markets: [MARKET_A, MARKET_B, MARKET_C] });
+    const path = writeTempJson([MARKET_A, MARKET_B, MARKET_C]);
     const result = loadManagedMarkets(path);
     expect(result).toHaveLength(3);
   });
 
   it("first element has marketId equal to the independently computed hash for MARKET_A", () => {
-    const path = writeTempJson({ markets: [MARKET_A, MARKET_B, MARKET_C] });
+    const path = writeTempJson([MARKET_A, MARKET_B, MARKET_C]);
     const result = loadManagedMarkets(path);
 
     const expected = computeMarketId({
@@ -232,7 +231,7 @@ describe("valid JSON — three markets", () => {
   });
 
   it("second element has marketId equal to the independently computed hash for MARKET_B", () => {
-    const path = writeTempJson({ markets: [MARKET_A, MARKET_B, MARKET_C] });
+    const path = writeTempJson([MARKET_A, MARKET_B, MARKET_C]);
     const result = loadManagedMarkets(path);
 
     const expected = computeMarketId({
@@ -247,7 +246,7 @@ describe("valid JSON — three markets", () => {
   });
 
   it("third element has marketId equal to the independently computed hash for MARKET_C", () => {
-    const path = writeTempJson({ markets: [MARKET_A, MARKET_B, MARKET_C] });
+    const path = writeTempJson([MARKET_A, MARKET_B, MARKET_C]);
     const result = loadManagedMarkets(path);
 
     const expected = computeMarketId({
@@ -262,7 +261,7 @@ describe("valid JSON — three markets", () => {
   });
 
   it("all three elements have capIds as empty arrays", () => {
-    const path = writeTempJson({ markets: [MARKET_A, MARKET_B, MARKET_C] });
+    const path = writeTempJson([MARKET_A, MARKET_B, MARKET_C]);
     const result = loadManagedMarkets(path);
     for (const market of result) {
       expect(market.capIds).toEqual([]);
@@ -270,7 +269,7 @@ describe("valid JSON — three markets", () => {
   });
 
   it("three markets produce three distinct marketIds", () => {
-    const path = writeTempJson({ markets: [MARKET_A, MARKET_B, MARKET_C] });
+    const path = writeTempJson([MARKET_A, MARKET_B, MARKET_C]);
     const result = loadManagedMarkets(path);
     const ids = result.map((m) => m.marketId);
     const unique = new Set(ids);
@@ -279,22 +278,22 @@ describe("valid JSON — three markets", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. Missing top-level "markets" key
+// 3. Invalid top-level shape
 // ---------------------------------------------------------------------------
 
-describe("missing top-level 'markets' key", () => {
-  it("throws an Error when the JSON object has no 'markets' key", () => {
-    const path = writeTempJson({ something_else: [] });
+describe("invalid top-level shape", () => {
+  it("throws an Error when the JSON root is an object instead of an array", () => {
+    const path = writeTempJson({ markets: [MARKET_A] });
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 
   it("the thrown error message mentions the file path", () => {
-    const path = writeTempJson({ something_else: [] });
+    const path = writeTempJson({ markets: [MARKET_A] });
     expect(() => loadManagedMarkets(path)).toThrow(path);
   });
 
-  it("throws when markets is an empty array (min 1 entry required)", () => {
-    const path = writeTempJson({ markets: [] });
+  it("throws when the array is empty (min 1 entry required)", () => {
+    const path = writeTempJson([]);
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 });
@@ -305,114 +304,89 @@ describe("missing top-level 'markets' key", () => {
 
 describe("missing 'label' in a market entry", () => {
   it("throws an Error when a market entry has no 'label' field", () => {
-    const entry = {
-      marketParams: MARKET_A.marketParams,
-      // label is intentionally omitted
-    };
-    const path = writeTempJson({ markets: [entry] });
+    const { label: _omit, ...entry } = MARKET_A;
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 
   it("the thrown error message mentions 'label'", () => {
-    const entry = {
-      marketParams: MARKET_A.marketParams,
-    };
-    const path = writeTempJson({ markets: [entry] });
+    const { label: _omit, ...entry } = MARKET_A;
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow(/label/);
   });
 
   it("throws when label is an empty string", () => {
     const entry = { ...MARKET_A, label: "" };
-    const path = writeTempJson({ markets: [entry] });
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 });
 
 // ---------------------------------------------------------------------------
-// 5. Missing marketParams.collateralToken
+// 5. Missing collateralToken
 // ---------------------------------------------------------------------------
 
-describe("missing marketParams.collateralToken", () => {
+describe("missing collateralToken", () => {
   it("throws an Error when collateralToken is absent", () => {
-    const { collateralToken: _omit, ...paramsWithout } = MARKET_A.marketParams;
-    const entry = { label: MARKET_A.label, marketParams: paramsWithout };
-    const path = writeTempJson({ markets: [entry] });
+    const { collateralToken: _omit, ...entry } = MARKET_A;
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 
   it("the thrown error message mentions 'collateralToken'", () => {
-    const { collateralToken: _omit, ...paramsWithout } = MARKET_A.marketParams;
-    const entry = { label: MARKET_A.label, marketParams: paramsWithout };
-    const path = writeTempJson({ markets: [entry] });
+    const { collateralToken: _omit, ...entry } = MARKET_A;
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow(/collateralToken/);
   });
 });
 
 // ---------------------------------------------------------------------------
-// 6. Invalid address format — marketParams.loanToken
+// 6. Invalid address format — loanToken
 // ---------------------------------------------------------------------------
 
-describe("invalid marketParams.loanToken", () => {
+describe("invalid loanToken", () => {
   it("throws an Error when loanToken is not a 0x address", () => {
-    const entry = {
-      ...MARKET_A,
-      marketParams: { ...MARKET_A.marketParams, loanToken: "not-an-address" },
-    };
-    const path = writeTempJson({ markets: [entry] });
+    const entry = { ...MARKET_A, loanToken: "not-an-address" };
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 
   it("throws an Error when loanToken is a plain hex string without 0x prefix", () => {
     const entry = {
       ...MARKET_A,
-      marketParams: {
-        ...MARKET_A.marketParams,
-        loanToken: "A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-      },
+      loanToken: "A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     };
-    const path = writeTempJson({ markets: [entry] });
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 
   it("throws an Error when loanToken is too short", () => {
-    const entry = {
-      ...MARKET_A,
-      marketParams: { ...MARKET_A.marketParams, loanToken: "0xA0b86991" },
-    };
-    const path = writeTempJson({ markets: [entry] });
+    const entry = { ...MARKET_A, loanToken: "0xA0b86991" };
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 });
 
 // ---------------------------------------------------------------------------
-// 7. Invalid lltv — non-numeric string
+// 7. Invalid lltv
 // ---------------------------------------------------------------------------
 
-describe("invalid marketParams.lltv", () => {
+describe("invalid lltv", () => {
   it("throws an Error when lltv is a non-numeric string", () => {
-    const entry = {
-      ...MARKET_A,
-      marketParams: { ...MARKET_A.marketParams, lltv: "not-a-number" },
-    };
-    const path = writeTempJson({ markets: [entry] });
+    const entry = { ...MARKET_A, lltv: "not-a-number" };
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 
   it("throws an Error when lltv is a decimal float string (not an integer string)", () => {
-    const entry = {
-      ...MARKET_A,
-      marketParams: { ...MARKET_A.marketParams, lltv: "0.86" },
-    };
-    const path = writeTempJson({ markets: [entry] });
+    const entry = { ...MARKET_A, lltv: "0.86" };
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 
   it("throws an Error when lltv is a number (not a string — JSON schema requires string)", () => {
-    const entry = {
-      ...MARKET_A,
-      marketParams: { ...MARKET_A.marketParams, lltv: 860000000000000000 },
-    };
-    const path = writeTempJson({ markets: [entry] });
+    const entry = { ...MARKET_A, lltv: 860000000000000000 };
+    const path = writeTempJson([entry]);
     expect(() => loadManagedMarkets(path)).toThrow();
   });
 });
