@@ -135,6 +135,10 @@ bun run test:coverage # Run tests with coverage report
 just check            # Lint + typecheck + tests
 ```
 
+### End-to-end testing on a forked mainnet
+
+For the full Anvil-fork verification (deploy a vault via the Forge script, run the Anvil-gated integration tests, and `DRY_RUN` the bot end-to-end against the deployed vault), follow the runbook at [`test/anvil-test-procedure.md`](test/anvil-test-procedure.md). It covers the two [`task.md`](task.md) Group 8.5 items that can't run in a no-RPC CI environment.
+
 ### Test coverage
 
 | Module | Stmts | Branch | Funcs |
