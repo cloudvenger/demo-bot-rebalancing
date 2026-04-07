@@ -104,7 +104,7 @@ Edit the file and replace `PASTE_THE_ORACLE_FROM_STEP_2` with the actual oracle 
 ```bash
 # Anvil account 0 — deployer / owner / curator
 export OWNER=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
-export PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+export PRIVATE_KEY=0xac097....ff80
 
 # Anvil account 1 — bot wallet
 export BOT_WALLET=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
@@ -117,11 +117,13 @@ export MANAGED_MARKETS_PATH=$(pwd)/managed-markets.anvil.json
 # export ABSOLUTE_CAP=500000000000
 # export RELATIVE_CAP_WAD=1000000000000000000
 
-forge script script/DeployVault.s.sol \
+forge script script/DeployVault.s.sol --tc DeployVault \
   --rpc-url $RPC_URL \
   --broadcast \
   -vvvv
 ```
+
+> `--tc DeployVault` is required because the script file also contains a `JsonMarketProbe` helper contract used to count entries in the JSON config; without `--tc`, forge errors with "Multiple contracts in the target path".
 
 Look for the **DEPLOYMENT SUMMARY** block in the output. Capture two addresses:
 

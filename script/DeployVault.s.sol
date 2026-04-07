@@ -146,6 +146,45 @@ error WrongIRM(uint256 marketIndex, address got, address expected);
 error VerificationFailed(string reason);
 
 // ---------------------------------------------------------------------------
+// Helper contract — used to count markets in the JSON config via try/catch
+// ---------------------------------------------------------------------------
+
+/// @notice Standalone probe so the deploy script can try/catch a cheatcode revert
+///         without referencing `address(this)` (forbidden in Foundry scripts).
+contract JsonMarketProbe {
+    /// @dev Forge cheatcode address (constant across all Foundry runs).
+    address constant VM_ADDRESS = address(uint160(uint256(keccak256("hevm cheat code"))));
+
+    /// @notice Attempt to read the .label field at `index` in the JSON array.
+    ///         Reverts when the index is past the end of the array.
+    function probe(string memory json, uint256 index) external view {
+        // forge-std's Vm interface — inlined to avoid an extra import for one call.
+        (bool ok, ) = VM_ADDRESS.staticcall(
+            abi.encodeWithSignature(
+                "parseJsonString(string,string)",
+                json,
+                string(abi.encodePacked("[", _toString(index), "].label"))
+            )
+        );
+        require(ok, "out of bounds");
+    }
+
+    function _toString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) return "0";
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) { digits++; temp /= 10; }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + value % 10));
+            value /= 10;
+        }
+        return string(buffer);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Deployment script
 // ---------------------------------------------------------------------------
 
@@ -363,15 +402,20 @@ contract DeployVault is Script {
 
         string memory json = vm.readFile(marketsPath);
 
-        // Count markets: the JSON must be a top-level array.
-        // We probe sequentially until parseJsonAddress fails (reverts on out-of-bounds).
-        // We use a try/catch-compatible approach: read length first via parseJsonUintArray on a
-        // length field if present, otherwise fall back to a bounded loop.
-        // Since vm.parseJson returns a dynamic array of the root, we use vm.parseJsonKeys.
-        // Simpler: require the JSON to have a predictable length — read it via a single
-        // vm.parseJsonUintArray on lltv values and take its length.
-        uint256[] memory lltvs = vm.parseJsonUintArray(json, "[*].lltv");
-        uint256 numMarkets = lltvs.length;
+        // Count markets: the JSON must be a top-level array. Foundry's vm.parseJsonKeys
+        // only supports JSON objects (not arrays) and the [*] wildcard isn't accepted by
+        // parseJson*Array on this version. We probe sequentially via a separately-deployed
+        // helper so the cheatcode revert can be caught (try/catch on `this` is forbidden
+        // in Foundry scripts).
+        JsonMarketProbe probe = new JsonMarketProbe();
+        uint256 numMarkets = 0;
+        while (numMarkets < 256) {
+            try probe.probe(json, numMarkets) {
+                numMarkets++;
+            } catch {
+                break;
+            }
+        }
         require(numMarkets > 0, "DeployVault: no markets found in JSON config");
 
         // Allocate storage for market data
